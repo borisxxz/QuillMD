@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">QuillMD</string>
+    <string name="title_activity_main">QuillMD</string>
+    <string name="package_name">com.quillmd.app</string>
+    <string name="custom_url_scheme">com.quillmd.app</string>
+</resources>

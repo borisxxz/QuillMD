@@ -1,0 +1,636 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Icon } from './icons.jsx'
+import { useI18n } from '../i18n.jsx'
+import {
+  baseName,
+  dirName as parentDir,
+  joinPath as join,
+  isValidName,
+  isExistsError,
+  normalizePathKey
+} from '../paths.js'
+import { copyToClipboard } from '../ui.js'
+import { useSidebarTree } from '../hooks/useSidebarTree.js'
+import SidebarContextMenu from './SidebarContextMenu.jsx'
+
+export default function Sidebar({
+  folderRoots,
+  onAddFolder,
+  onRemoveFolder,
+  activePath,
+  onOpenFile,
+  onOpenRight,
+  onExportPdf,
+  onExportHtml,
+  onExportPandoc,
+  // 历史版本… on a file row (undefined where there is no history store).
+  onShowHistory,
+  refreshNonce,
+  syncSupported = false,
+  syncFolderPaths = [],
+  onEnableSyncFolder,
+  // Open tabs follow a file/folder renamed or moved in the tree.
+  onPathMoved,
+  // Filled with { startRename(path) } for the rename command (F2, #156).
+  apiRef,
+  // One section of the sidebar (SidebarPanes): 'workspace' (the folder
+  // roots) or 'cloud' (云空间: every folder in cloud sync). `collapsible`:
+  // the title folds the section (only when there are two).
+  variant = 'workspace',
+  collapsible = false,
+  collapsed = false,
+  onToggleCollapsed,
+  // Folders in 云空间 — their rows carry a ☁ in either tree.
+  cloudRootPaths = [],
+  // 云空间 only: roots not connected to a cloud yet (muted note), the
+  // title's sync status, + (add a sync folder), and the root menu actions.
+  unconnectedPaths = [],
+  headStatus = null,
+  onAddCloudFolder,
+  onAddToWorkspace,
+  onOpenSyncSettings,
+  onStopSync,
+  workspaceRootPaths = []
+}) {
+  const cloud = variant === 'cloud'
+  const { t } = useI18n()
+  const copyText = (text) => copyToClipboard(text, t('code.copied'))
+  const [menu, setMenu] = useState(null) // { x, y, node }
+  const [rename, setRename] = useState(null) // { path, value }
+  // Inline creation: { dir, type: 'file'|'folder', value }
+  const [creating, setCreating] = useState(null)
+  // Guards against committing a creation twice (e.g. Enter immediately followed
+  // by the input's blur, or a click on the confirm button + blur).
+  const committingRef = useRef(false)
+  // Drag-and-drop: path being dragged, and the folder currently hovered as a
+  // drop target (for highlighting).
+  const dragPathRef = useRef(null)
+  const [dragOver, setDragOver] = useState(null)
+  const { childrenMap, expanded, setExpanded, loadDir, toggle, activeRowRef } =
+    useSidebarTree({ folderRoots, activePath, refreshNonce })
+  const folderRootsKey = folderRoots.join('\n')
+  const defaultRoot = folderRoots[0] || null
+  const rootSet = new Set(folderRoots.map(normalizePathKey))
+  const syncRootSet = new Set(syncFolderPaths.map(normalizePathKey))
+  const cloudRootSet = new Set(cloudRootPaths.map(normalizePathKey))
+  const unconnectedSet = new Set(unconnectedPaths.map(normalizePathKey))
+  const workspaceRootSet = new Set(workspaceRootPaths.map(normalizePathKey))
+  const isRootPath = (p) => rootSet.has(normalizePathKey(p))
+  const syncRootForPath = (path) => {
+    // 云空间's folders are in cloud sync already: no 加入云同步 item there.
+    if (cloud) return null
+    const key = normalizePathKey(path)
+    return folderRoots
+      .map(normalizePathKey)
+      .filter((root) => key === root || key.startsWith(root + '/'))
+      .sort((a, b) => b.length - a.length)[0] || null
+  }
+
+  useEffect(() => {
+    setCreating(null)
+  }, [folderRootsKey])
+
+  const closeMenu = useCallback(() => setMenu(null), [])
+  useEffect(() => {
+    if (!menu) return
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('blur', closeMenu)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('blur', closeMenu)
+    }
+  }, [menu, closeMenu])
+
+  const refreshParentOf = async (path) => {
+    const p = parentDir(path)
+    if (childrenMap[p] !== undefined) await loadDir(p)
+  }
+
+  // Start inline creation for a file
+  const startNewFile = (dirNode) => {
+    const dir = dirNode ? dirNode.path : defaultRoot
+    if (!dir) return
+    setCreating({ dir, type: 'file', value: 'untitled.md' })
+    // The root is rendered as a normal tree node in a multi-root workspace.
+    // Ensure it is visible before mounting its single inline creation field.
+    setExpanded((s) => new Set(s).add(dir))
+    if (!childrenMap[dir]) loadDir(dir)
+  }
+
+  // Start inline creation for a folder
+  const startNewFolder = (dirNode) => {
+    const dir = dirNode ? dirNode.path : defaultRoot
+    if (!dir) return
+    setCreating({ dir, type: 'folder', value: t('prompt.newFolderDefault') })
+    setExpanded((s) => new Set(s).add(dir))
+    if (!childrenMap[dir]) loadDir(dir)
+  }
+
+  // Commit the inline creation
+  const commitCreate = async () => {
+    if (!creating || committingRef.current) return
+    committingRef.current = true
+    const { dir, type, value } = creating
+    const name = value.trim()
+    setCreating(null)
+    if (!name) {
+      committingRef.current = false
+      return
+    }
+    if (!isValidName(name)) {
+      committingRef.current = false
+      window.alert((t('err.invalidName') || 'Invalid name: ') + name)
+      return
+    }
+
+    try {
+      if (type === 'file') {
+        let fileName = name
+        if (!/\.[a-z0-9]+$/i.test(fileName)) fileName += '.md'
+        const path = join(dir, fileName)
+        await window.api.createFile(path, '')
+        await loadDir(dir)
+        onOpenFile(path)
+      } else {
+        await window.api.createDir(join(dir, name))
+        await loadDir(dir)
+        setExpanded((s) => new Set(s).add(dir))
+      }
+    } catch (e) {
+      window.alert(
+        isExistsError(e)
+          ? t('err.nameExists')
+          : (type === 'file' ? t('err.createFile') : t('err.createFolder')) + e.message
+      )
+    } finally {
+      committingRef.current = false
+    }
+  }
+
+  const doDelete = async (node) => {
+    if (!window.confirm(t('confirm.trash', { name: node.name }))) return
+    try {
+      await window.api.deleteItem(node.path)
+      await refreshParentOf(node.path)
+    } catch (e) {
+      window.alert((t('err.delete') || 'Could not delete: ') + e.message)
+    }
+  }
+
+  const doDuplicate = async (node) => {
+    try {
+      await window.api.duplicate(node.path)
+      await refreshParentOf(node.path)
+    } catch (e) {
+      window.alert(isExistsError(e) ? t('err.nameExists') : (t('err.duplicate') || 'Could not duplicate: ') + e.message)
+    }
+  }
+
+  // Recursively load every subfolder and expand them all. Depth-capped and
+  // visited-guarded so a symlink cycle or a pathologically deep tree can't spin
+  // into unbounded IPC recursion.
+  const expandAll = async () => {
+    if (!folderRoots.length) return
+    const dirs = new Set(folderRoots)
+    const seen = new Set()
+    const walk = async (dir, depth) => {
+      if (depth > 30 || seen.has(dir)) return
+      seen.add(dir)
+      let nodes = childrenMap[dir]
+      if (nodes === undefined) nodes = await loadDir(dir)
+      for (const n of nodes || []) {
+        if (n.type === 'dir') {
+          dirs.add(n.path)
+          await walk(n.path, depth + 1)
+        }
+      }
+    }
+    for (const root of folderRoots) await walk(root, 0)
+    setExpanded(dirs)
+  }
+
+  // Move a dragged file/folder into a destination directory.
+  const moveInto = async (srcPath, destDir) => {
+    if (!srcPath || !destDir) return
+    const src = normalizePathKey(srcPath)
+    const dest = normalizePathKey(destDir)
+    // Workspace roots are mount points, not movable tree items. Moving one would
+    // physically relocate the user's folder but leave folderRoots pointing at the
+    // old path.
+    if (isRootPath(srcPath)) return
+    // No-op if it's already in that folder; never move a folder into itself or
+    // one of its own descendants.
+    if (parentDir(src) === dest) return
+    if (dest === src || dest.startsWith(src + '/')) return
+    try {
+      await window.api.rename(srcPath, join(destDir, baseName(srcPath)))
+    } catch (e) {
+      window.alert(isExistsError(e) ? t('err.nameExists') : (t('err.move') || 'Could not move: ') + e.message)
+      return
+    }
+    onPathMoved?.(srcPath, join(destDir, baseName(srcPath)))
+    await refreshParentOf(srcPath)
+    if (childrenMap[destDir] !== undefined) await loadDir(destDir)
+    setExpanded((s) => new Set(s).add(destDir))
+  }
+
+  // Drop handlers wired onto folder rows (and the root area).
+  const dropProps = (destDir) => ({
+    onDragOver: (e) => {
+      if (!dragPathRef.current) return
+      e.preventDefault()
+      e.stopPropagation()
+      e.dataTransfer.dropEffect = 'move'
+      if (dragOver !== destDir) setDragOver(destDir)
+    },
+    onDragLeave: () => setDragOver((d) => (d === destDir ? null : d)),
+    onDrop: (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const src = dragPathRef.current
+      dragPathRef.current = null
+      setDragOver(null)
+      moveInto(src, destDir)
+    }
+  })
+
+  const commitRename = async () => {
+    if (!rename || committingRef.current) return
+    const { path, value } = rename
+    const clean = value.trim()
+    setRename(null)
+    if (!clean || clean === baseName(path)) return
+    if (!isValidName(clean)) {
+      window.alert((t('err.invalidName') || 'Invalid name: ') + clean)
+      return
+    }
+    committingRef.current = true
+    try {
+      await window.api.rename(path, join(parentDir(path), clean))
+      onPathMoved?.(path, join(parentDir(path), clean))
+      await refreshParentOf(path)
+    } catch (e) {
+      window.alert(isExistsError(e) ? t('err.nameExists') : (t('err.rename') || 'Could not rename: ') + e.message)
+    } finally {
+      committingRef.current = false
+    }
+  }
+
+  // Inline rename of a row that is currently shown (not a workspace root).
+  // Returns false when the row is not in the tree, so the caller can fall
+  // back to the rename dialog.
+  const treeRef = useRef(null)
+  const startRenameRef = useRef(null)
+  startRenameRef.current = (path) => {
+    if (!path || isRootPath(path)) return false
+    const key = normalizePathKey(path)
+    const row = [...(treeRef.current?.querySelectorAll('.tree-row[data-path]') || [])]
+      .find((el) => normalizePathKey(el.dataset.path) === key)
+    if (!row) return false
+    row.scrollIntoView?.({ block: 'nearest' })
+    setMenu(null)
+    setRename({ path: row.dataset.path, value: baseName(row.dataset.path) })
+    return true
+  }
+  useEffect(() => {
+    if (!apiRef) return
+    apiRef.current = { startRename: (path) => startRenameRef.current?.(path) ?? false }
+    return () => { apiRef.current = null }
+  }, [apiRef])
+
+  // The section title: folds the section when there are two (VS Code's
+  // explorer sections), else a plain label.
+  const title = cloud ? t('cloud.title') : t('workspace.title')
+  const titleNode = collapsible ? (
+    <button
+      type="button"
+      className="sidebar-title sidebar-section-toggle"
+      aria-expanded={!collapsed}
+      title={collapsed ? t('side.expandSection') : t('side.collapseSection')}
+      onClick={() => onToggleCollapsed?.()}
+    >
+      <Icon name="chevron-right" size={13} className={`sidebar-section-chevron${collapsed ? '' : ' chevron-expanded'}`} />
+      <span>{title}</span>
+    </button>
+  ) : (
+    <span className="sidebar-title">{title}</span>
+  )
+
+  // 云空间: its own head (title, sync status, +) and empty state.
+  if (cloud && (collapsed || !folderRoots.length)) {
+    return (
+      <div className={`sidebar sidebar-cloud${collapsed ? ' collapsed' : ''}`} data-variant="cloud">
+        <div className="sidebar-head">
+          {titleNode}
+          <div className="sidebar-head-actions">
+            {headStatus}
+            <button title={t('cloud.addTitle')} onClick={() => onAddCloudFolder?.()}>
+              <Icon name="plus" size={15} />
+            </button>
+          </div>
+        </div>
+        {!collapsed && (
+          <div className="tree-empty sidebar-cloud-empty">
+            {t('cloud.empty')}
+            {' · '}
+            <button type="button" className="sidebar-cloud-add" onClick={() => onAddCloudFolder?.()}>{t('cloud.add')}</button>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Workspace folded (a second section is shown below it).
+  if (!cloud && collapsible && collapsed) {
+    return (
+      <div className="sidebar collapsed" data-variant="workspace">
+        <div className="sidebar-head">{titleNode}</div>
+      </div>
+    )
+  }
+
+  // Empty state: no folder roots yet.
+  if (!folderRoots.length) {
+    if (collapsible) {
+      return (
+        <div className="sidebar" data-variant="workspace">
+          <div className="sidebar-head">{titleNode}</div>
+          <div className="sidebar-empty">
+            <div className="sidebar-empty-panel">
+              <div className="sidebar-empty-icon">
+                <Icon name="folder" size={24} />
+              </div>
+              <button className="btn-primary sidebar-empty-action" onClick={() => onAddFolder()}>
+                <Icon name="folder" size={15} />
+                {t('workspace.addFolder')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+    return (
+      <div className="sidebar-empty">
+        <div className="sidebar-empty-panel">
+          <div className="sidebar-empty-icon">
+            <Icon name="folder" size={24} />
+          </div>
+          <button className="btn-primary sidebar-empty-action" onClick={() => onAddFolder()}>
+            <Icon name="folder" size={15} />
+            {t('workspace.addFolder')}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // Inline confirm (✓) / cancel (✗) buttons shown while creating or renaming.
+  // onMouseDown preventDefault keeps the input focused so clicking a button
+  // doesn't first fire the input's blur-to-commit.
+  const editActions = (onConfirm, onCancel) => (
+    <span className="tree-edit-actions" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        className="tree-edit-btn confirm"
+        title={t('edit.confirm')}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={(e) => { e.stopPropagation(); onConfirm() }}
+      >
+        <Icon name="check" size={13} />
+      </button>
+      <button
+        type="button"
+        className="tree-edit-btn cancel"
+        title={t('edit.cancel')}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={(e) => { e.stopPropagation(); onCancel() }}
+      >
+        <Icon name="close" size={12} />
+      </button>
+    </span>
+  )
+
+  // Render the inline creation input
+  const renderCreatingInput = (depth) => (
+    <div className="tree-row creating-row" style={{ paddingLeft: 8 + depth * 14 }}>
+      <span className="tree-chevron" />
+      <Icon name={creating.type === 'file' ? 'file' : 'folder'} size={15} className="tree-icon" />
+      <input
+        className="tree-rename"
+        autoFocus
+        value={creating.value}
+        onFocus={(e) => {
+          // Preselect the name without its extension — once, on mount. (Doing
+          // this in an effect keyed on `creating` reselected on every keystroke,
+          // so each new character overwrote the last.)
+          const dot = creating.value.lastIndexOf('.')
+          if (dot > 0) e.target.setSelectionRange(0, dot)
+          else e.target.select()
+        }}
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => setCreating({ ...creating, value: e.target.value })}
+        // Commit when focus leaves the input (clicking elsewhere), matching the
+        // rename field — so a typed name is never silently lost.
+        onBlur={commitCreate}
+        onKeyDown={(e) => {
+          e.stopPropagation()
+          if (e.key === 'Enter') { e.preventDefault(); commitCreate() }
+          if (e.key === 'Escape') setCreating(null)
+        }}
+      />
+      {editActions(commitCreate, () => setCreating(null))}
+    </div>
+  )
+
+  const renderNode = (node, depth) => {
+    const isDir = node.type === 'dir'
+    const isOpen = expanded.has(node.path)
+    const isActive = node.path === activePath
+    const renaming = rename && rename.path === node.path
+    const isDropTarget = isDir && dragOver === node.path
+    const isRoot = isRootPath(node.path)
+    return (
+      <div key={node.path}>
+        <div
+          ref={isActive ? activeRowRef : undefined}
+          className={`tree-row${isActive ? ' active' : ''}${isDropTarget ? ' drag-over' : ''}`}
+          style={{ paddingLeft: 8 + depth * 14 }}
+          data-path={node.path}
+          // Focusable on click, so F2 renames the row the user picked
+          // (a folder too) rather than the open document.
+          tabIndex={-1}
+          draggable={!renaming && !isRoot}
+          onDragStart={(e) => {
+            if (isRoot) {
+              e.preventDefault()
+              return
+            }
+            dragPathRef.current = node.path
+            e.dataTransfer.effectAllowed = 'move'
+            e.dataTransfer.setData('text/plain', node.path)
+          }}
+          onDragEnd={() => {
+            dragPathRef.current = null
+            setDragOver(null)
+          }}
+          {...(isDir ? dropProps(node.path) : {})}
+          onClick={() => (isDir ? toggle(node) : onOpenFile(node.path))}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            const syncRootPath = syncSupported ? syncRootForPath(node.path) : null
+            setMenu({
+              x: e.clientX,
+              y: e.clientY,
+              node,
+              isRoot,
+              variant,
+              inWorkspace: workspaceRootSet.has(normalizePathKey(node.path)),
+              syncRootPath,
+              syncRootRegistered: syncRootPath ? syncRootSet.has(normalizePathKey(syncRootPath)) : false
+            })
+          }}
+          title={node.path}
+        >
+          {isDir ? (
+            <Icon name="chevron-right" size={14} className={`tree-chevron${isOpen ? ' chevron-expanded' : ''}`} />
+          ) : (
+            <span className="tree-chevron" />
+          )}
+          <Icon name={isDir ? (isOpen ? 'folder-open' : 'folder') : 'file'} size={15} className="tree-icon" />
+          {renaming ? (
+            <>
+              <input
+                className="tree-rename"
+                autoFocus
+                value={rename.value}
+                onFocus={(e) => {
+                  // Preselect the name (without extension), like the new-file input.
+                  const dot = rename.value.lastIndexOf('.')
+                  if (dot > 0) e.target.setSelectionRange(0, dot)
+                  else e.target.select()
+                }}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => setRename({ ...rename, value: e.target.value })}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitRename()
+                  if (e.key === 'Escape') setRename(null)
+                }}
+                onBlur={commitRename}
+              />
+              {editActions(commitRename, () => setRename(null))}
+            </>
+          ) : (
+            <span className="tree-label">{node.name}</span>
+          )}
+          {!renaming && cloud && isRoot && unconnectedSet.has(normalizePathKey(node.path)) && (
+            <span className="tree-note">{t('cloud.notConnected')}</span>
+          )}
+          {!renaming && cloudRootSet.has(normalizePathKey(node.path)) && (
+            <span className="tree-cloud-badge" title={t('cloud.badge')} aria-label={t('cloud.badge')}>
+              <Icon name="cloud" size={13} />
+            </span>
+          )}
+        </div>
+        {/* Inline creation input inside this directory */}
+        {isDir && isOpen && creating && creating.dir === node.path && renderCreatingInput(depth + 1)}
+        {isDir && isOpen && (childrenMap[node.path] || []).map((c) => renderNode(c, depth + 1))}
+        {/* Expanded but nothing to show (the tree only lists Markdown/text and
+            subfolders) — say so instead of looking like the click did nothing. */}
+        {isDir && isOpen && childrenMap[node.path]?.length === 0 &&
+          !(creating && creating.dir === node.path) && (
+            <div className="tree-empty tree-empty-nested" style={{ paddingLeft: 8 + (depth + 1) * 14 }}>
+              {t('side.emptyFolder')}
+            </div>
+          )}
+      </div>
+    )
+  }
+
+  return (
+    <div className={`sidebar${cloud ? ' sidebar-cloud' : ''}`} data-variant={variant}>
+      <div className="sidebar-head">
+        {titleNode}
+        <div className="sidebar-head-actions">
+          {cloud && headStatus}
+          {cloud && (
+            <button title={t('cloud.addTitle')} onClick={() => onAddCloudFolder?.()}>
+              <Icon name="plus" size={15} />
+            </button>
+          )}
+          {/* 云空间 keeps its title short (status + add); new file / folder
+              are in the context menu there. */}
+          {!cloud && <>
+          <button className="workspace-add-root" title={t('workspace.addFolder')} onClick={() => onAddFolder()}>
+            <Icon name="folder-open" size={15} />
+          </button>
+          <span className="sidebar-action-sep" aria-hidden="true" />
+          <button title={t('side.newFile')} onClick={() => startNewFile(null)}>
+            <Icon name="file-plus" size={15} />
+          </button>
+          <button title={t('side.newFolder')} onClick={() => startNewFolder(null)}>
+            <Icon name="folder-plus" size={15} />
+          </button>
+          <span className="sidebar-action-sep" aria-hidden="true" />
+          {(() => {
+            // Toggle: when everything's collapsed (only roots open), expand all;
+            // otherwise collapse back to just the roots. Icon reflects the action.
+            const collapsed = expanded.size <= folderRoots.length
+            return (
+              <button
+                title={collapsed ? t('side.expandAll') : t('side.collapseAll')}
+                onClick={collapsed ? expandAll : () => setExpanded(new Set(folderRoots))}
+              >
+                <Icon name={collapsed ? 'expand' : 'collapse'} size={15} />
+              </button>
+            )
+          })()}
+          </>}
+        </div>
+      </div>
+      <div
+        ref={treeRef}
+        className={`tree${dragOver === defaultRoot ? ' drag-over-root' : ''}`}
+        {...(defaultRoot ? dropProps(defaultRoot) : {})}
+        onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY, node: null, isRoot: false }) }}
+        onDoubleClick={(e) => {
+          // Only the empty area (the .tree itself, not a row) surfaces the menu —
+          // double-clicking a file/folder keeps its normal open/toggle behavior.
+          if (e.target === e.currentTarget) setMenu({ x: e.clientX, y: e.clientY, node: null, isRoot: false })
+        }}
+      >
+        {/* Multi-root: each folderRoot is a synthetic top-level folder node. */}
+        {!folderRoots.length ? (
+          <div className="tree-empty">{t('side.empty')}</div>
+        ) : (
+          folderRoots.map((root) =>
+            renderNode({ name: baseName(root), path: root, type: 'dir' }, 0)
+          )
+        )}
+      </div>
+
+      <SidebarContextMenu
+        menu={menu}
+        t={t}
+        onClose={closeMenu}
+        onNewFile={startNewFile}
+        onNewFolder={startNewFolder}
+        onAddFolder={onAddFolder}
+        onOpenRight={onOpenRight}
+        onRemoveFolder={onRemoveFolder}
+        onEnableSyncFolder={onEnableSyncFolder}
+        onCopyText={copyText}
+        onRename={(node) => setRename({ path: node.path, value: node.name })}
+        onDuplicate={doDuplicate}
+        onExportPdf={onExportPdf}
+        onExportHtml={onExportHtml}
+        onExportPandoc={onExportPandoc}
+        onShowHistory={onShowHistory}
+        onDelete={doDelete}
+        onAddToWorkspace={onAddToWorkspace}
+        onOpenSyncSettings={onOpenSyncSettings}
+        onStopSync={onStopSync}
+      />
+    </div>
+  )
+}

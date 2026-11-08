@@ -1,0 +1,13 @@
+{
+  "appId": "com.quillmd.app",
+  "appName": "QuillMD",
+  "webDir": "dist-mobile",
+  "ios": {
+    "contentInset": "never",
+    "backgroundColor": "#fdfbf7"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#fdfbf7"
+  }
+}

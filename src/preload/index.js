@@ -1,0 +1,216 @@
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
+
+// Subscribe to a main→renderer channel; returns an unsubscribe function.
+const on = (channel) => (cb) => {
+  const fn = (_e, payload) => cb(payload)
+  ipcRenderer.on(channel, fn)
+  return () => ipcRenderer.removeListener(channel, fn)
+}
+
+// Manual rich/source bug reproduction is opt-in at process launch. The main
+// process keeps the switch authoritative; the renderer only pays the tracing
+// cost when the switch is present.
+const inputTraceEnabled = ipcRenderer.sendSync('debug:inputTraceEnabled') === true
+
+const api = {
+  // dialogs
+  openFiles: () => ipcRenderer.invoke('dialog:openFiles'),
+  openAttachments: () => ipcRenderer.invoke('dialog:openAttachments'),
+  openFolder: () => ipcRenderer.invoke('dialog:openFolder'),
+  saveAs: (defaultName) => ipcRenderer.invoke('dialog:saveAs', defaultName),
+  previewPDF: (source, defaultName, options, sourcePath) =>
+    ipcRenderer.invoke('pdf:preview', { source, defaultName, options, sourcePath }),
+  savePDFPreview: (token, defaultName) =>
+    ipcRenderer.invoke('pdf:savePreview', { token, defaultName }),
+  disposePDFPreview: (token) => ipcRenderer.invoke('pdf:disposePreview', token),
+  previewHTML: (source, defaultName, options, sourcePath) =>
+    ipcRenderer.invoke('html:preview', { source, defaultName, options, sourcePath }),
+  saveHTMLPreview: (token, defaultName) =>
+    ipcRenderer.invoke('html:savePreview', { token, defaultName }),
+  disposeHTMLPreview: (token) => ipcRenderer.invoke('html:disposePreview', token),
+  detectPandoc: () => ipcRenderer.invoke('pandoc:detect'),
+  selectPandocExecutable: () => ipcRenderer.invoke('pandoc:selectExecutable'),
+  exportWithPandoc: (payload) => ipcRenderer.invoke('pandoc:export', payload),
+  openPandocResult: (kind) => ipcRenderer.invoke('pandoc:openResult', kind),
+  allowLocalFonts: () => ipcRenderer.invoke('permissions:allowLocalFonts'),
+
+  // fs
+  readFile: (path) => ipcRenderer.invoke('fs:readFile', path),
+  writeFile: (path, content, options) => ipcRenderer.invoke('fs:writeFile', path, content, options),
+  conflictCopyPath: (path) => ipcRenderer.invoke('fs:conflictCopyPath', path),
+  // Local version history + 「最近删除」 (docs/cloud-sync-review.md P1).
+  historyList: (path) => ipcRenderer.invoke('history:list', path),
+  historyRead: (path, id) => ipcRenderer.invoke('history:read', path, id),
+  historyRestore: (path, id) => ipcRenderer.invoke('history:restore', path, id),
+  historyPin: (path, id, pinned) => ipcRenderer.invoke('history:pin', path, id, pinned),
+  historyDeleted: () => ipcRenderer.invoke('history:deleted'),
+  historyReadDeleted: (id) => ipcRenderer.invoke('history:readDeleted', id),
+  historyRestoreDeleted: (id) => ipcRenderer.invoke('history:restoreDeleted', id),
+  historyUsage: () => ipcRenderer.invoke('history:usage'),
+  historyClear: () => ipcRenderer.invoke('history:clear'),
+  historyConfigure: (options) => ipcRenderer.invoke('history:configure', options),
+  rename: (oldPath, newPath) => ipcRenderer.invoke('fs:rename', oldPath, newPath),
+  deleteItem: (path) => ipcRenderer.invoke('fs:delete', path),
+  createFile: (path, content) => ipcRenderer.invoke('fs:createFile', path, content),
+  createDir: (path) => ipcRenderer.invoke('fs:createDir', path),
+  duplicate: (path) => ipcRenderer.invoke('fs:duplicate', path),
+  readDir: (dir) => ipcRenderer.invoke('fs:readDir', dir),
+  listFiles: (root) => ipcRenderer.invoke('fs:listFiles', root),
+  openFolderTree: (dir) => ipcRenderer.invoke('fs:openFolderTree', dir),
+  getPathForDroppedFile: (file) => webUtils.getPathForFile(file),
+  classifyDroppedPaths: (paths) => ipcRenderer.invoke('fs:classifyPaths', paths),
+  setShowHidden: (val) => ipcRenderer.invoke('settings:setShowHidden', val),
+  // Strict offline mode. Main owns the persisted flag; this is the bridge for
+  // the Settings toggle and the startup mirror sync.
+  getOfflineMode: () => ipcRenderer.invoke('offline:get'),
+  setOfflineMode: (enabled) => ipcRenderer.invoke('offline:set', enabled),
+  onOfflineChanged: on('offline:changed'),
+
+  // Workspace-wide content search (issue #120).
+  searchWorkspace: (request) => ipcRenderer.invoke('search:workspace', request),
+
+  // Sync workspaces: the renderer can register an explicitly selected root,
+  // but never receives registry paths or arbitrary network/credential access.
+  syncListWorkspaces: () => ipcRenderer.invoke('sync:workspaceList'),
+  syncAdoptWorkspace: (rootPath) => ipcRenderer.invoke('sync:workspaceAdopt', rootPath),
+  syncRemoveWorkspace: (rootPath) => ipcRenderer.invoke('sync:workspaceRemove', rootPath),
+  syncListConnections: () => ipcRenderer.invoke('sync:connectionList'),
+  syncAddWebDavConnection: (config) => ipcRenderer.invoke('sync:connectionAddWebDav', config),
+  syncAddS3Connection: (config) => ipcRenderer.invoke('sync:connectionAddS3', config),
+  syncUpdateConnection: (connectionId, config) => ipcRenderer.invoke('sync:connectionUpdate', connectionId, config),
+  syncRemoveConnection: (connectionId) => ipcRenderer.invoke('sync:connectionRemove', connectionId),
+  syncTestConnection: (connectionId) => ipcRenderer.invoke('sync:connectionTest', connectionId),
+  syncBindWorkspaceConnection: (rootPath, connectionId) =>
+    ipcRenderer.invoke('sync:workspaceBindConnection', rootPath, connectionId),
+  syncPreview: (rootPath, strategy) => ipcRenderer.invoke('sync:preview', rootPath, strategy),
+  syncRun: (rootPath, strategy, options) => ipcRenderer.invoke('sync:run', rootPath, strategy, options),
+  onSyncProgress: on('sync:progress'),
+  // action: 'pause' | 'resume' | 'stop'
+  syncControl: (rootPath, action) => ipcRenderer.invoke('sync:control', rootPath, action),
+  syncStatus: () => ipcRenderer.invoke('sync:status'),
+  syncListRemoteWorkspaces: (connectionId) => ipcRenderer.invoke('sync:remoteWorkspaceList', connectionId),
+  syncJoinWorkspace: (rootPath, connectionId, workspaceId) => ipcRenderer.invoke('sync:workspaceJoin', rootPath, connectionId, workspaceId),
+
+  // watch
+  // owner: 'workspace' (default) | 'cloud' — a folder watched for both
+  // closes when both stopped.
+  watchStart: (dir, owner) => ipcRenderer.invoke('watch:start', dir, owner),
+  watchStop: (dir, owner) => ipcRenderer.invoke('watch:stop', dir, owner),
+  watchFile: (path) => ipcRenderer.invoke('watch:file', path),
+  unwatchFile: (path) => ipcRenderer.invoke('watch:unfile', path),
+
+  // shell
+  openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
+  openFileUrl: (url) => ipcRenderer.invoke('shell:openFileUrl', url),
+  showInFolder: (path) => ipcRenderer.invoke('shell:showInFolder', path),
+  copyText: (text) => ipcRenderer.invoke('clipboard:writeText', String(text ?? '')),
+
+  // image host: write the bytes to a temp file, run the user's upload command on
+  // it, and return the URL it prints. Returns { ok, url } or { ok:false, error }.
+  uploadImage: (command, name, bytes) =>
+    ipcRenderer.invoke('image:upload', command, name, bytes),
+
+  // save a pasted/dropped image into the document's assets/ folder (no image
+  // host); returns { ok, path } with a relative path to insert into Markdown.
+  saveImage: (docPath, name, bytes) =>
+    ipcRenderer.invoke('image:save', docPath, name, bytes),
+  // save an image pasted into an UNSAVED doc to the global paste folder; returns
+  // { ok, url } (a file:// URL) so it shows as a real path, not a base64 blob.
+  savePaste: (name, bytes) => ipcRenderer.invoke('image:savePaste', name, bytes),
+  // at save time, move base64 / paste-folder images into the doc's assets/ and
+  // rewrite the Markdown to relative paths; returns { content, changed }.
+  inlineForSave: (content, targetPath) =>
+    ipcRenderer.invoke('image:inlineForSave', content, targetPath),
+  // copy arbitrary files into the document's assets/ folder and return a
+  // relative Markdown link target.
+  saveAttachment: (docPath, sourcePath) =>
+    ipcRenderer.invoke('attachment:save', docPath, sourcePath),
+
+  // custom themes (user CSS files in userData/themes)
+  themesList: () => ipcRenderer.invoke('themes:list'),
+  themeRead: (file) => ipcRenderer.invoke('themes:read', file),
+  themesReveal: () => ipcRenderer.invoke('themes:reveal'),
+
+  // window controls (custom title-bar buttons on Windows/Linux)
+  windowMinimize: () => ipcRenderer.invoke('window:minimize'),
+  windowToggleMaximize: () => ipcRenderer.invoke('window:toggleMaximize'),
+  windowClose: () => ipcRenderer.invoke('window:close'),
+  windowIsMaximized: () => ipcRenderer.invoke('window:isMaximized'),
+  windowToggleDevTools: () => ipcRenderer.invoke('window:toggleDevTools'),
+  // Settings › General: with close-to-tray on, closing the window hides it to
+  // the tray instead of quitting (tray icon / the show-hide shortcut bring it
+  // back).
+  setCloseToTray: (enabled) => ipcRenderer.invoke('window:setCloseToTray', enabled),
+  // Command palette + global keybindings: hide/show the window (main owns the
+  // window) and push the user's effective OS-level accelerators. Only command
+  // ids whitelisted in the main process are registered.
+  toggleWindowVisibility: () => ipcRenderer.invoke('window:toggleVisibility'),
+  setGlobalShortcuts: (accelerators) => ipcRenderer.invoke('window:setGlobalShortcuts', accelerators),
+
+  // in-app update (#164): check, download (verified in main), install on restart
+  checkUpdate: () => ipcRenderer.invoke('update:check'),
+  updateDownload: () => ipcRenderer.invoke('update:download'),
+  updateCancel: () => ipcRenderer.invoke('update:cancel'),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
+  updateShowFile: () => ipcRenderer.invoke('update:showFile'),
+  updateGetState: () => ipcRenderer.invoke('update:getState'),
+  onUpdateState: on('update:state'),
+  setMenuKeybindings: (accelerators) => ipcRenderer.invoke('menu:setKeybindings', accelerators),
+  getMenuKeybindings: () => ipcRenderer.invoke('menu:getKeybindings'),
+  getMenuSnapshot: () => ipcRenderer.invoke('menu:getSnapshot'),
+
+  // Development-only manual input tracing. The main process ignores these
+  // calls unless QuillMD was launched with --horsemd-input-trace.
+  inputTraceEnabled,
+  getInputTraceInfo: () => ipcRenderer.invoke('debug:inputTraceInfo'),
+  writeInputTrace: (entry) => ipcRenderer.invoke('debug:inputTrace', entry),
+
+  // app close: main asks before closing so the renderer can warn about unsaved
+  // changes, then calls confirmAppClose() to proceed or cancelAppClose() to abort.
+  confirmAppClose: () => ipcRenderer.send('app:confirm-close'),
+  cancelAppClose: () => ipcRenderer.send('app:cancel-close'),
+  // Renderer signals it has registered its main→renderer listeners (e.g.
+  // open-paths); main then delivers any files/folders queued at launch (#36).
+  appReady: () => ipcRenderer.send('app-ready'),
+
+  // events from main
+  onOpenPaths: on('open-paths'),
+  onOpenFolderPath: on('open-folder'),
+  onMenu: on('menu'),
+  onWatchChanged: on('watch:changed'),
+  onFileChanged: on('file:changed'),
+  onWindowMaximized: on('window:maximized'),
+  onAppCloseRequest: on('app-close-request'),
+
+  platform: process.platform,
+
+  // Feature capabilities for the renderer to gate UI uniformly across desktop /
+  // mobile (mobile provides its own set via the Capacitor shim). Exposed HERE,
+  // not added later in the renderer: contextBridge freezes this object, so
+  // assigning `window.api.capabilities` from the renderer throws ("object is not
+  // extensible") and white-screens the app. Desktop supports everything.
+  capabilities: {
+    folderWorkspace: true,
+    watch: true,
+    windowControls: true,
+    // Desktop-only: closing the window can hide it to the system tray, with a
+    // global shortcut to bring it back.
+    closeToTray: true,
+    // Desktop-only: OS-level (globalShortcut) commands such as show/hide window.
+    globalShortcuts: true,
+    devtools: true,
+    pdfExport: true,
+    htmlExport: true,
+    pandocExport: true,
+    imageHostExec: true,
+    nativeMenus: true,
+    externalShell: true,
+    revealInFolder: true,
+    splitView: true,
+    fileAttachments: true,
+    cloudSync: true,
+    nativeDropOpen: true
+  }
+}
+
+contextBridge.exposeInMainWorld('api', api)

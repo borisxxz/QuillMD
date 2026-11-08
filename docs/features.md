@@ -1,0 +1,550 @@
+# 功能与实现
+
+下面按功能列出**怎么用**和**怎么实现的**（附对应文件）。
+
+---
+
+## 1. 标签页 / 单窗口多文件
+
+- 打开多个 `.md` 在同一窗口，`Ctrl+Tab` / `Ctrl+Shift+Tab` 循环切换
+- 在资源管理器双击 `.md` → 不新开程序，而是在已有窗口加一个标签
+- 从 Finder / 文件资源管理器把一个或多个文件拖入桌面窗口 → 分别打开为标签；正文内图片拖入仍由编辑器插图逻辑处理
+- 新建：标签条末尾的 **+**、顶栏右侧独立的 **+** 按钮、`Ctrl+N`，都调同一个 `newTab`（新建未命名草稿，首次 `Ctrl+S` 选位置保存）
+
+**实现**：
+- 主进程 `requestSingleInstanceLock()` + `second-instance` 事件，把第二次启动的 argv 转发给已有窗口（`src/main/index.js`）
+- 渲染层 `openPaths()` 用 `tabsRef` 同步快照去重，避免 setState 竞态导致重复标签（`useFileOps.js`）
+
+## 2. 文件夹工作区（侧边栏文件树）
+
+- `Ctrl+Shift+O` 打开文件夹，左侧树状浏览；右键可新建 / 重命名 / **复制一份** / 删除 / **导出为 PDF** / 在资源管理器中显示
+- 从 Finder / 文件资源管理器把文件夹拖入窗口即可加入多根工作区；首次启动正在显示大纲时会自动切到文件树
+- **拖拽移动**：把文件/文件夹拖到另一个文件夹（或根目录）即可移动，落点文件夹高亮提示
+- 顶部 **展开全部 / 折叠全部** 按钮一键切换（图标随状态翻转，展开会递归展开所有子目录）
+- 活动栏有**常驻的折叠 / 展开侧边栏**按钮（收起后图标翻转成"展开"样式）
+- 在资源管理器右键文件夹 **"用 HorseMD 打开"** → 作为工作区打开（启动参数支持文件夹路径）
+- 外部增删文件会自动刷新树
+
+**实现**：`useWorkspace.js` 管理多根工作区和目录 watcher，`useSidebarTree.js` 管理树加载/展开，`Sidebar.jsx` 与 `SidebarContextMenu.jsx` 负责交互；桌面外部拖入由 `useDropOpen.js` 接管，preload 通过 Electron `webUtils.getPathForFile()` 解析真实磁盘路径，主进程 `filesystem.js` 用 `stat()` 分类文件/目录；移动端明确关闭该 capability。文件夹启动参数见 `main/index.js` 的 `extractArgs()`（区分文件 vs 目录，目录走 `open-folder`）。
+
+> - 新建 / 重命名输入框带**行内确认（✓）/ 取消（✗）**按钮；**失焦即提交**（点别处不会丢掉已输入的名字）。
+> - 重命名时输入框默认选中**文件名（不含扩展名）**，和新建一致（`onFocus` 里 `setSelectionRange(0, dotIndex)`）。
+> - 展开的空目录会显示"空文件夹"提示，而不是一片空白。
+> - 拖拽移动通过 HTML5 DnD（`draggable` + `dataTransfer`）+ 主进程的重命名/移动 IPC 完成（`dropProps()` / `moveItem()`）。
+
+## 3. 所见即所得编辑 + 块级控件
+
+WYSIWYG 由 Milkdown Crepe 提供。在它之上自研了**改标题层级**的多种入口（共用一条 `setBlock` → `convertBlock` 路径）：
+
+| 入口 | 用法 |
+| --- | --- |
+| 键盘 | `Ctrl+1`…`Ctrl+6` 设标题、`Ctrl+0` 转正文 |
+| 选中工具条 | 选中文字 → Crepe 工具条里注入的 **H** 按钮，悬浮展开 H1/H2/H3/¶ |
+| 右键菜单 | 编辑区右键 → 紧凑的“转换为”子菜单；关闭选中工具条后，选中文字右键还会提供“文字格式”和“审阅标记”子菜单 |
+| 状态栏切换器 | 右下角常驻显示当前块类型，点开可切换 |
+| Crepe 原生 | 行首 `/` 斜杠菜单、行首 `# `、左侧块手柄 |
+
+选中工具条的按钮（加粗/斜体/删除线/行内代码/链接）都带了 **tooltip**。设置 → 编辑器 → 编辑可关闭该工具条；关闭后，文本选区的右键菜单保留紧凑的“文字格式”“审阅标记”“转换为”一级入口，悬停或键盘聚焦后展开对应子菜单。它包含原有块级/列表转换、粗体、斜体、删除线、行内代码、链接、高亮及审阅标记（新增、删除、替换、高亮 + 评论），但不会把全部动作平铺成超长菜单。菜单在打开时保存精确 ProseMirror 选区，避免焦点切换到菜单后误作用于别处。正文前不再显示“正文 / H1 / H2”等浮动块级胶囊；块类型仍可通过状态栏、选中工具条、右键菜单、快捷键和 Crepe 原生入口切换。
+
+**实现**（`Editor.jsx`）：
+- `convertBlock(view, type, attrs)` → `view.dispatch(state.tr.setNodeMarkup(pos, targetType, attrs))`，作用于光标所在的 textblock
+- 工具条按钮：用 `MutationObserver` 监听 `.milkdown-toolbar` 出现，注入自定义 `.hm-heading-item`，CSS `:hover` 展开子菜单（并覆盖 Crepe 工具条的 `overflow:hidden` 以免裁掉子菜单）
+- 块类型定义集中在 `blocks.js`，标签文案走 i18n
+
+## 4. 当前文件自动刷新（外部修改）
+
+外部程序（如 agent、其它编辑器）改了正在打开的文件 → 编辑器自动重载，无需手动关开。
+
+**实现**：
+- 主进程对每个打开的文件单独 chokidar 监听（`watchers.js` 的 `watch:file`），`change` 时推 `file:changed {path, mtimeMs}`
+- 渲染层 `useFileOps.js` 为打开的文件挂/卸监听，收到变更后：
+  - 若该标签**有未保存修改** → 不覆盖（保护你的编辑）
+  - 否则从磁盘重载，并 bump `reloadNonce` 让 Editor 重挂载
+  - 忽略自己保存产生的回声（比对 mtime）
+
+## 5. Ctrl/Cmd + 点击链接
+
+按住 `Ctrl`(Win)/`Cmd`(Mac) 点链接 → 系统浏览器打开。
+
+**实现**：`Editor.jsx` 在 `view.dom` 捕获阶段拦截 `click`，命中 `http(s):`/`mailto:` 链接走 `shell.openExternal`。
+
+## 6. 富文本复制（带 inline style）
+
+复制内容时，剪贴板 HTML 版本注入内联样式，粘到微信公众号/邮件/Notion 等不读外部 CSS 的地方也能保留格式（加粗、标题大小、行内代码、代码块灰底、引用、表格边框等）。剪贴板同时提供三个用途明确的通道：
+
+- `text/plain`：用户实际选中的可见文字，粘贴到记事本、终端或普通输入框时不增加段落空行和列表编号；富文本中可见的普通源码单换行保持为一个换行。
+- `text/html`：带内联样式的富文本，供公众号、邮件、Notion、Word 等目标使用。
+- `text/markdown`：Milkdown serializer 生成的结构化 Markdown，仅供 HorseMD 内部粘贴优先恢复列表、加粗和行内代码等结构。
+
+**实现**：`editor-dom-content.js` 拦截 `copy` 事件，分别写入三个 MIME；`editor-copy.js` 只在剪贴板克隆中把 CSS 视觉软换行物化为 `<br>`，随后套用固定浅色配色的内联样式，不修改 ProseMirror 或磁盘源码。CodeMirror 代码块内的复制交还给它自己处理，代码块按钮则通过原生剪贴板 IPC 写入完整代码。
+
+## 7. 相对路径图片解析
+
+`![](./img/foo.png)` 这类相对路径图片，按当前文件所在文件夹解析成 `file://` 绝对路径并正常显示。
+
+**实现**：`Editor.jsx` 用 `MutationObserver` 把相对路径 `<img>` 的 `src` 改写成 `file://`。**只改 DOM 显示，不动文档模型** —— 保存时磁盘里仍是相对路径，不污染文件。
+
+### 图片交互（双击放大 / 说明 / 本地化）
+
+- **单击图片** → Crepe 原生交互：选中、并可加**图片说明（caption）**。点说明按钮后会**自动聚焦**说明输入框，直接打字即可（组件本身不聚焦，需我们补 `focus()`）。
+- **双击图片** → 灯箱里放大查看（点背景 / ✕ / Esc 关闭）。
+- 图片说明、上传按钮等文案**跟随中英文切换**。
+
+**实现**（`Editor.jsx`）：
+- 放大用**自己的双击判定**（同一 `img` 的 `src` 在 350ms 内点两次），不用原生 `dblclick`—— 图片是 Vue 组件，单击选中会重渲染，原生 `dblclick` 常不触发；详见 [implementation-notes.md](./implementation-notes.md)。判定**排除**说明输入框 / 说明按钮 / 缩放手柄，避免抢它们的点击。
+- 灯箱 `.hm-image-lightbox` 是纯显示覆盖层，不改文档。
+- 文案本地化：用 `imageBlockConfig` / `inlineImageConfig`，创建时按当前语言设置，切换语言时更新配置并直接改已渲染 `.caption-input` 的 placeholder。
+
+## 8. 大纲 / 命令面板 / 查找替换
+
+- 大纲（`Ctrl/Cmd+Shift+L`）：从内容解析标题，点击跳转，随编辑实时更新（`Outline.jsx`）。标题可折叠/展开，顶部只有一个类似文件树的总开关；默认保留前两层真实目录层级（H1/H2/H3 显示 H1+H2，全 H1 文档则全部显示），折叠包含当前标题的父级时，父级保持高亮提示。桌面端可拖动标题左侧抓手重排同一父级下的章节，标题、所有子标题和正文会整体移动；改动直接作用于原始 Markdown 区段，不经整篇序列化。源码模式使用标准 Markdown AST 解析标题，避免代码块、Setext、转义或行内格式造成两种模式目录不一致。
+- **悬浮章节导航（桌面）**：未打开侧栏大纲时，含标题的文档右侧显示低干扰圆点；悬停或键盘聚焦后展开为可滚动标题列表，当前章节同步高亮，点击后平滑跳转。它复用 `useOutline.js` 的缓存标题位置，不增加第二套滚动监听；长标题省略显示并保留原生完整标题提示。侧栏处于“大纲”时悬浮导航自动隐藏，避免两处同时争夺注意力。
+- 命令面板（`Ctrl+P`）：模糊搜索文件与命令（`CommandPalette.jsx`）
+- 查找 / 替换（`Ctrl+F`）：文档内查找，实时显示 `当前/总数` 计数，next/prev 即时跳转；查找栏可展开**替换**，支持替换单个 / 全部，富文本与源码模式都可用
+
+**查找实现**（`useFindReplace.js` + `find.js`）：富文本使用 **CSS Custom Highlight API**（`CSS.highlights` + `Highlight`），不改编辑器 DOM；源码 textarea 使用字符 offset + 同样排版参数的镜像测量，将当前命中居中并绘制主题感知的固定高亮层。搜索只覆盖编辑器正文，**绝不匹配查找框自己的文字**；上下一个全在前端完成，无 IPC 往返。
+
+**替换实现**（issue #19，`useFindReplace.js` 的 `applyReplace`）：富文本里把 DOM Range 转成 ProseMirror 位置、**一笔事务**自下而上替换所有匹配（`tr.insertText`，程序化、不走输入规则，不会误触发审阅标记守卫）；源码 textarea 走偏移量、同样自下而上。替换后重跑搜索保持计数正确，单个替换会把光标落到下一个匹配。
+
+## 8b. 源码可读审阅标记
+
+做审阅时，标记**仍留在 Markdown 源码里可见**，而不是藏在编辑器私有状态里；源码模式、磁盘文件、交给 AI 的文本都读同一套标注。支持新增 `{++new++}`、删除 `{--old--}`、替换 `{~~old~>new~~}`、高亮评论 `{==text==}{>>note<<}`。
+
+- 选中工具条、命令面板，以及关闭选中工具条后的右键“审阅标记”子菜单都能插入这些审阅标记。
+- **审阅：复制 AI 提示词**（AI handoff）会复制一段 prompt + 带审阅标注的全文，方便交给外部 AI 继续处理。
+- PR1 先做 **inline-first / single-paragraph-first**；复杂线程、跨段元数据和多轮状态留作后续范围。
+- **Accept All / Reject All** 可一键接受或拒绝全部标记，把文档清回普通 Markdown。
+
+**实现**：
+- `reviewMarkup.js` 负责扫描、包裹、接受/拒绝和 AI prompt；`editor-review-decorations.js` 构建装饰，`editor-review-card.js` 管理卡片 DOM，`editor-review.js` 保留插件状态机和命令入口
+- `Editor.jsx` 负责选区工具条入口，`App.jsx` 把命令面板、源码模式、Accept All / Reject All 和 AI handoff 接到同一套逻辑
+- **渲染**：4 种标记在富文本里都**实时渲染**（新增/删除/替换/高亮各用一套 `hm-review-*` 装饰，替换还带 `->` 箭头小部件），磁盘与源码模式里仍是原始 `{++…++}` 等字面文本
+- **替换标记的删除线碰撞修复**：`{~~旧~>新~~}` 的波浪号会撞上 GFM 删除线输入规则，曾导致富文本里打字就吞掉标记/删行（Mac 上尤甚）。两层修复——守卫插件 `createStrikeGuardPlugin`（prepend 到 `prosePluginsCtx` 最前，`handleTextInput` 抢在输入规则前按字面插入）+ `appendTransaction` 兜底用 `oldState` 还原 compositionend 路径（macOS 输入法）的破坏。详见 [implementation-notes.md](./implementation-notes.md) 的"bug 22"
+
+## 9. 主题（含莫兰迪）
+
+6 套配色：暖光、暖夜、莫兰迪·灰绿 / 豆沙 / 雾蓝 / 暮。右下角状态栏带色块的主题选择器；`Ctrl/Cmd+Shift+T` 循环切换。设置 → 外观可开启“跟随系统外观”，分别选择日间和夜间的内置主题（默认暖光 / 暖夜）；操作系统变更浅色或深色偏好时会即时切换。
+
+**实现**：
+- `themes.js` 注册表，每套主题 = 一个 `base`（light/dark，驱动 Crepe 明暗规则）+ 可选 `theme-*` 类（覆盖调色板变量）
+- `applyTheme(id)` 设置 `body.className = base [+ ' theme-*']`
+- `useSystemColorScheme.js` 监听 `matchMedia('(prefers-color-scheme: dark)')`；系统模式只计算当前生效的内置主题，不改写用户手动主题或文档内容。用户的自定义 CSS 片段继续叠加，可用 `@media (prefers-color-scheme: dark)` 写仅夜间生效的规则；导入的第三方完整主题仍属于手动模式。
+- 调色板变量在 `styles/app.css`（`body.light` / `body.dark` / `body.theme-morandi*`）
+
+## 10. 多语言（中 / 英）
+
+整个界面可在英文/中文间实时切换，默认跟随系统语言。状态栏有 🌐 切换。
+
+**实现**：
+- `i18n.jsx`：`STRINGS{en,zh}` 翻译表 + `I18nProvider` 上下文 + `useI18n()` 的 `t(key, vars)`
+- 各组件用 `t('...')` 取文案；`App.jsx` 自身用 `translate(lang, key)`
+- 编辑器占位符通过 Crepe `featureConfigs[Placeholder].text` 本地化
+
+## 11. 首次引导
+
+全新安装首次打开 → 自动弹出本地化的《欢迎使用 HorseMD》文档（介绍软件、功能、快捷键）。只出现一次。
+
+**实现**：`App.jsx` 检测 `localStorage` 无 `horsemd.onboarded.v1` 且无恢复标签时，把 `onboarding.js` 的内容作为一个标签打开。
+
+## 12. 首页（欢迎页）+ 最近文件 + 主页按钮
+
+无打开文件时显示欢迎页：Logo + 标题（带**版本号**，如 `HorseMD v0.1.6`）+ 标语 + 三个操作按钮 + **最近文件列表** + 快捷键提示。活动栏**最上方有一个 App 图标按钮（主页）**，随时点它回到欢迎页。
+
+**实现**（`App.jsx` 的 `Welcome` 组件 + 活动栏）：
+- 最近文件：每次打开文件时 `remember()` 记录 `{path, name, dir, openedAt}`，去重、上限 8、持久化在会话
+- 相对时间 `relTime()`：刚刚 / N 分钟前 / N 小时前 / 昨天 / 日期（本地化）
+- 点击条目打开文件；**没有"清空"按钮**（产品决策）
+- **版本号**：构建时由 Vite `define` 注入 `__APP_VERSION__`（取自 `package.json`，见 `electron.vite.config.mjs`），和 `app.getVersion()` 一致
+- **主页按钮**：`home` 状态控制显示欢迎页，但**保留已打开标签的编辑器挂载**（只隐藏），所以回到文档不会重建编辑器、不卡；点任意标签 / 新建 / 打开 / 大纲跳转 / 查找都会退出主页
+
+## 13. 新文档：一级标题 + 正文段落
+
+新建/空文档第一行是**空的一级标题**（Typora 式标题），**下面带一个空的正文段落**。想写标题就写;想跳过标题直接写正文,点一下下面那行(或按 ↓)即可。
+
+**实现**（`Editor.jsx`,在设基线前完成、所以新标签不会被标"已修改"）：若文档是单个空段落,则把首块转成 H1,并在其后插入一个空段落,光标默认留在标题。
+
+> 历史:早期只把首行转成 H1、**没有正文块**,导致"不写标题就没法写正文"(整篇只有一个标题、也没正文块可点),只能"写完标题→回车→才到正文"。补上正文段落后即可跳过标题直接写。
+
+## 14. 窗口拖拽
+
+顶栏空白处（含标签条背景）和活动栏空白都能拖动窗口；标签、按钮、输入框可点。
+
+**实现**：`styles/app.css` 用 `-webkit-app-region` —— `.topbar / .tabs / .tabs-scroll / .activity-bar` 设 `drag`，`.tab / .tab-new / .drag-no / input / .activity-item` 设 `no-drag`。
+
+## 15. 纯文本（.txt）走快速编辑器
+
+`.md/.markdown/.mdx` 用 Crepe 富文本；`.txt`（及其它带路径的非 Markdown 文件）用 `textarea` 纯文本编辑。这样：大文件秒开不卡、原始换行保留、不会把 `*`/`#` 误当 Markdown 语法。新建的未命名文档（无路径）仍是富文本。
+
+**实现**（`EditorArea.jsx` + `paths.js`）：`isPlainTextDoc(tab)` 决定每个标签的编辑器；富文本标签**首次激活才挂载、之后常驻**，纯文本标签只在激活时渲染。
+
+### 15b. 每个标签独立的源码 / 富文本视图状态
+
+`Ctrl+/` 或底部状态按钮只切换**当前标签**的视图模式。切到另一个标签时，那个标签保持自己的富文本/源码状态；再切回来也恢复原状态。这是 UI 视图状态，不写入 Markdown，也不持久化到会话。
+
+**实现**（`useSourceModeSwitch.js` + `EditorArea.jsx`）：
+- `sourceModeIds` 用 `tab.id` 记录哪些标签当前在源码模式，关闭标签时清理。
+- 源码 textarea 是非受控输入，内容写入 `liveContentRef`；textarea 因切 tab 重挂时用 live buffer 作为 `defaultValue`，避免未保存源码编辑丢失。
+- `sourceEditedIds` 只标记真正改过的源码 buffer；切回富文本时仅这些标签调用 `replaceMarkdown()` 同步到已挂载 Crepe，未编辑的源码切换不触发 dirty。
+
+### 15c. 同一文档的源码 + 富文本实时预览（桌面）
+
+富文本编辑区右键菜单的“**源码 + 预览**”会把同一 Markdown 同时展示为左侧无控制源码 textarea 和右侧已挂载的 Crepe 富文本。它不是双文件分屏：两个面板共享一个标签、一份保存内容和一套脏状态。双栏两侧均使用完整面板宽度，而不是沿用单栏阅读模式的居中最大宽度；左侧尾部阅读留白与右侧一致，右上角“关闭预览”直接返回普通富文本视图。源码的加粗光标完整放在字符边界前，非空行首也可准确定位。
+
+**实现**：`useSplitSourceRichSync.js` 用 revision 取消旧的源码输入 debounce，约 180ms 后调用既有 `replaceMarkdown()` 更新只读右侧预览。`useSplitScrollSync.js` 使用 `scrollAnchor` 的内容锚点而非原始滚动条百分比，并抑制程序化滚动的回显。普通文本、未加载富文本的重文档、移动端及“双文件分屏”期间不提供入口。完整约束见 [source-rich-split-view-architecture.md](./source-rich-split-view-architecture.md)。
+
+### 16b. 重文档自动用纯文本极速模式打开
+
+有些 Markdown 文件**几乎没有空行**（笔记/转写直接粘进来，几千行连续不空行）。Markdown 会把它们压成几个超大段落、段内有上千个换行节点，ProseMirror 近乎平方级渲染 → **主线程能卡死十几秒**（实测一个 81KB 文件冻结 10.2 秒）。
+
+为此 HorseMD **自动识别"重文档"**，默认用纯文本极速模式打开（瞬间、零卡顿），顶部给一个 **「渲染为富文本」** 按钮，需要时再按需加载（这时才会有几秒解析 + 骨架屏）。
+
+**实现**（`App.jsx`）：`isHeavyDoc(content)` —— 单段落**连续非空行 > 150 行**，或总长 > 400KB，即判定为重文档（结构而非单纯大小：结构良好的 120KB 文档照常富文本）。`heavy` 标记在文件载入时算一次存到标签上；`richForced`（Set）记录用户对某标签的"仍要富文本"选择。重文档默认走 `usesTextarea` 分支（和 `.txt` 同款 textarea）。
+
+## 16. 原生 HTML 表格渲染
+
+文档里直接写的 HTML 表格（`<table><tr><td>…</td></tr></table>`）会**渲染成真正的表格**，而不是显示成转义后的源码（Typora 也是这个行为）。其它块级 HTML（`<div>`、`<details>` 等）同样渲染。
+
+**实现**（`Editor.jsx`）：Milkdown 默认的 `html` 节点把内容当转义文本显示。我们给它加了一个 **ProseMirror node view**（`renderHtmlNodeView`）渲染真实 HTML：
+- **只改显示，不动文档模型** —— 节点仍通过 `attrs.value` 原样进出，保存时磁盘里还是原始 HTML，不破坏文件
+- 只对识别到的**块级标签**（`<table>` 等，见 `RENDER_HTML_RE`）渲染；零散的内联片段（落单的 `<b>`）退回默认文本显示，避免不闭合标签把版面搞乱
+- 渲染前 `sanitizeHtml()` 去掉 `<script>/<style>` 和 `on*` 事件属性、`javascript:` 链接（在 `<template>` 里解析,表格片段能正确解析）
+- 节点是 atom（不可编辑内部），`ignoreMutation` 让 ProseMirror 不去 reconcile 渲染出的 HTML
+- 注册入口：`crepe.editor.config` 里 `ctx.update(nodeViewCtx, (v) => [...v, ['html', …]])`（在 `crepe.create()` 之前）—— **必须走 `nodeViewCtx`**（`$view` 的同款通道），不能用 `editorViewOptionsCtx.nodeViews`，否则会覆盖图片/代码块/表格等组件的节点视图。详见 [implementation-notes.md](./implementation-notes.md) 的"致命 bug 12"
+- 样式 `.hm-html-block`（`styles/app.css`），表格边框/表头用主题变量,跟随明暗与莫兰迪配色
+
+**宽度自适应**：渲染的 HTML 表格跟随排版编辑区宽度。带显式 `width` 属性的表格恢复作者语义（`width="100%"` 跟随容器、固定像素宽度如 gov.cn 的 `<table width="950">` 收缩到容器宽）；列允许收缩换行，表格内图片按单元格宽度显示，避免整表横向溢出、窄窗口下"显示不全"（`styles/app.css` 中 `.hm-html-block` 的 `max-width: 100%`、`table[width] { width: unset }`、`td/th { min-width: 0 }` 与 `table img { width: 100% }`）。Markdown（GFM）表格保持独立横向滚动，不受影响。
+
+## 17. 导出为 PDF
+
+`文件 → 导出为 PDF…`（`Ctrl/Cmd+Shift+E`，或命令面板）打开浏览器式 PDF 导出中心：左侧调整页面与文档结构，右侧用 PDF.js 显示 `printToPDF` 生成的真实分页。最终保存当前预览对应的同一份 PDF，且**不带编辑器自身的控件**（代码块工具条、表格手柄、块手柄、加号按钮等）。
+
+导出前可选择 A4、A3、Letter 或 50–1000 mm 的自定义尺寸，并设置纵向/横向。分页既可交给 Chromium 自动处理，也可在一级、二级或三级标题前强制换页，或把 Markdown 分隔符作为“本页结束”标记。
+
+**实现**：
+- `editor-api.js` 的异步 `getPdfSource()` 委托 `editor-pdf-content.js` 克隆当前 ProseMirror 视图并生成干净 HTML、标题和图片列表。导出器先主动把 LaTeX 物化为 MathML、把 Mermaid 物化为经过安全清理且保留原始比例的 SVG，再移除编辑器控件；普通 CodeMirror 代码块仍压平成 `<pre><code>`。Mermaid 导出不依赖 live preview 是否位于可视区或已经加载，语法错误或超时则保留源码。
+- PDF source 在清理编辑器 class/style 前会测量每张可见表格的总宽度和首行列边界，并写成专用 `data-hm-pdf-*` 与 `<colgroup>` 百分比。紧凑表以实测像素宽度打印，宽表才限制为 `100%`；隐藏或无法测量的表格回退为 `table-layout: auto`。打印样式不得再对所有表格使用固定等分列宽。
+- PDF 表格单元格保留编辑器同样的紧凑密度：`th/td > p` 必须清除 margin/padding 并继承 cell line-height，避免全局 `.doc p` 段距进入每个单元格。该规则只作用于表格内部，不能通过降低正文段距解决。
+- 支持 A4/A3/Letter/自定义尺寸、横纵向、四档边距、8–24pt 正文字号、50%–200% 整体缩放、标题/分隔符分页、打印目录页、目录层级、PDF 书签、页眉页脚、标题、日期、页码和页码范围；代码与表头背景默认保留。正文字号由标准化后的 `fontSizePt` 写入 `--hm-pdf-font-size`，默认 11pt；标题、表格、代码和间距使用相对单位随正文等比变化，整体缩放则继续作用于完整页面内容。
+- `usePdfExport` 管理打开与保存状态；`usePdfPreview` 负责防抖、过期结果隔离和预览会话清理。renderer 的 `getPdfSource()` 用占位符和图片清单描述当前已解析的本地/网络图片，主进程 `pdf-images.js` 将其暂存到隔离打印目录后再由 `pdf-export.js` 等待字体与图片、生成 Tagged PDF/书签并缓存最新 Buffer。这样打印窗口不依赖相对路径、浏览器缓存或远程图片的第二次直接加载。同一渲染器始终只有一个生成任务，设置变化会取消旧任务并只保留最新请求。
+- PDF 取消必须遵守打印阶段边界：进入 `printToPDF()` 前可销毁隐藏窗口，进入后必须让当前打印自然结束并把结果标记为 stale。`latest-task-runner.js` 等待旧 worker 的异步 `finally` 完成后才启动最后一次请求，避免 Chromium 打印后端尚未恢复时触发 `Printing failed`。专项事故记录见 [pdf-preview-printing-race-report.md](./pdf-preview-printing-race-report.md)。
+- `pdf-document.js` 保持纯函数，负责尺寸、范围、目录和打印模板；`pdf-print-styles.js` 单独维护打印 CSS。临时 HTML 使用禁止脚本执行的 CSP，隐藏窗口保持 Electron 默认 Web 安全策略。
+- 多标签下导出当前聚焦文档。`editor-api-registry.js` 按 `tab.id` 注册 API，侧栏对尚未打开的文件导出时等待明确的 ready 通知，不依赖固定延迟或错误命中其他标签。
+- 预览型格式的导出合同和回归矩阵见 [pdf-rendered-content-export-report.md](./pdf-rendered-content-export-report.md)；表格事故复盘和通用 PDF 工程流程分别见 [pdf-table-layout-fidelity-report.md](./pdf-table-layout-fidelity-report.md) 与 [pdf-visual-fidelity-runbook.md](./pdf-visual-fidelity-runbook.md)。
+- **排版密度（0.12.50）**：`PDF_DENSITY_VALUES`（comfort/standard/compact）在 `pdf-print-styles.js` 把 12 条间距规则（行高、段落、标题、列表、引用、图片、公式、分隔线）参数化为 `var(--hm-pdf-*, 旧字面量)`；`standard` 逐字等于改动前的硬编码值（no-op 基线，由 `test-pdf-density.mjs` 锁定），`compact` 收紧全部间距、`comfort` 放宽。标题行高 1.3、代码 1.6、表格单元格 1.4 与 `th/td > p` 复位保持硬编码（不动表格测量）。`em` 间距不随 `line-height` 变化，所以必须把全部间距规则一起参数化才能均匀紧凑。密度下方实时显示预览的真实页数（`onPageCount` 回调）。只持久化 `densityPreset`（`settings.lastPdfDensityPreset`），不持久化整个 options 包（页眉/页脚/标题/页码范围是每篇文档的，不能串文档）。
+- **导出保存位置（0.12.50）**：PDF/HTML/Pandoc 保存对话框默认打开在源 Markdown 所在目录；`export-prefs.js` 按源文件记住用户改过的目录（同一个文件记住、不同文件各自回自己文件夹），未命名文档回退到全局上次目录，持久化在 `userData/export-prefs.json`。纯决策逻辑拆到 `export-prefs-logic.js` 供 `test-export-prefs.mjs` 在无 Electron 环境锁定语义。
+
+### 17b. HTML 预览导出与 Pandoc 文档转换
+
+桌面端“文件”菜单和命令面板提供两条互不混淆的输出链路：
+
+- **导出 HTML**打开独立 Studio。`useHtmlExport.js` 只管理打开/保存状态，`useHtmlPreview.js` 只管理防抖预览会话，`components/html-export/` 只负责界面；主进程 `html-export.js` 负责图片暂存、预览 token 和精确保存，`html-document.js` 是不依赖 Electron 的模板纯函数。
+- **使用 Pandoc 导出**直接转换当前 Markdown，支持 docx、epub、tex、odt、rtf 和 txt。`pandoc-core.js` 保存格式白名单和参数纯函数，`pandoc-export.js` 负责检测、选择程序、保存路径和错误映射，`subprocess.js` 负责无 shell、超时和输出上限。
+
+两条链路都从当前聚焦标签取得最新内容：源码模式读取非受控 textarea 的 live buffer，富文本模式先 `flushMarkdown()`，不能只读可能滞后的 React tab snapshot。HTML 使用与 PDF 相同的异步结构化快照，因此 Mermaid、LaTeX、表格、任务列表和图片的物化规则一致，但页面模板和设置模型独立，不能用 PDF CSS 临时拼成网页。
+
+HTML 预览返回不透明 token，保存时写入该 token 对应的同一份 HTML，避免“预览一种、保存另一种”。输出移除脚本、iframe、object、embed、form、事件属性和 `javascript:` URL，模板附带 CSP；iframe 预览也保持无权限 sandbox。
+
+Pandoc 可执行文件只从已验证的绝对路径运行，参数由目标格式白名单生成，Markdown 通过 stdin 传入，不经过 shell。已有文件的目录作为 `--resource-path`，配置只保存程序路径。架构和验收细节见 [document-export-architecture.md](./document-export-architecture.md)。
+
+## 18. 自定义窗口按钮（Windows / Linux）+ 关闭前确认
+
+Windows/Linux 下不再用系统原生的标题栏覆盖层，改由渲染层自己画 **最小化 / 最大化(还原) / 关闭** 三个按钮，带自定义 hover 态（关闭悬浮变红）。macOS 仍用原生红绿灯。
+
+**实现**：
+- 主进程关掉 `titleBarOverlay`，提供 `window:minimize/toggleMaximize/close/isMaximized` IPC；并监听 `maximize/unmaximize` 推 `window:maximized` 给渲染层，让"最大化/还原"图标跟真实窗口状态同步（双击拖拽最大化、系统快捷键都能跟上）
+- 渲染层 `Topbar` 在 `platform === 'win32' || platform === 'linux'` 时渲染
+  `WindowControls`。Windows 使用宽扁的 `win-*` 按钮；Linux 使用独立 `.is-linux` 类和
+  `gtk-min/gtk-max/gtk-restore` 图标，按钮间距与 hover 形态按 GTK 桌面习惯处理。
+
+**关闭未保存提醒**：关**标签**（`closeTab`）和关**窗口/退出**都会在有未保存修改时弹本地化确认框。
+- 关标签：`App.jsx` 的 `closeTab` 直接 `window.confirm(confirm.closeUnsaved)`。
+- 关窗口（macOS 红灯 / Windows 或 Linux 关闭按钮 / Cmd·Ctrl+Q）：主进程拦截窗口 `close`，用 `allowClose` 标志，未确认时 `preventDefault` 并发 `app-close-request`；渲染层查脏标签，干净或用户确认（`confirm.quitUnsaved`）后调 `confirmAppClose()` → 主进程置 `allowClose=true` 再关。干净时无弹窗、不卡。详见 [implementation-notes.md](./implementation-notes.md)。
+
+## 19. 大文档加载骨架屏
+
+打开大文档（渲染要花点时间）时，先显示一组**波动的灰色占位条**（骨架屏），加载完自动消失；小文件秒开、不显示。
+
+**实现**（`Editor.jsx` + `styles/app.css`）：**按内容大小触发**（`initialContent.length > 8000`），而非时间延迟（同一大文档冷/热启动耗时差很多，时间方案不可靠）。骨架 `.editor-skeleton` 用主题变量 `--border-soft`、`opacity` 呼吸式波动，位置和正文对齐。
+
+> **关键时序**：`loaded` 必须在 `crepe.create()` 一完成（内容已进 DOM）就**用 `flushSync` 同步置 true**，而不是普通 `setState`。否则 React 会把它和紧随其后的重活（`getMarkdown()` 整篇序列化 + `onChange` 触发大纲/字数重算）批处理到一起，导致**正文已渲染、骨架屏却还压在上面几百毫秒**（切换源码↔富文本时尤其明显）。序列化/`onChange` 这步也推迟到下一帧再做，让骨架屏先消失。详见 [implementation-notes.md](./implementation-notes.md)。
+
+## 20. 更新提示（仅通知，不自动下载）+ 更新内容
+
+启动时查一次 GitHub 最新**正式** release（草稿/预发布被该接口排除），若有新版本则弹一个可关闭的"有新版本"提示;关掉后记住,不再骚扰。**不在应用内下载/安装**。提示里**自动展示该 release 的更新说明**(GitHub release notes),内容长则在卡片内滚动(细滚动条)。
+
+**实现**：主进程 `update:check` 用 `net.fetch` 打 `releases/latest`，比对 `app.getVersion()`，并把 `data.body`(发布说明)截断后作为 `notes` 一并返回；渲染层启动时调一次,记 `localStorage["horsemd.update.dismissed"]`（`App.jsx`）。`UpdateToast.jsx` 把 `notes`(Markdown)**用纯 React 元素**轻量渲染成标题/要点/粗体/行内代码(**不注入 HTML,无 XSS**),版本号显示为"旧版删除线 → 新版药丸"。
+
+## 21. 分屏（左右双栏）
+
+两个文档**左右并排、都可编辑**。开启方式：
+- 标签或文件树**右键 → 「在右侧分屏打开」**（文件树的还能直接把未打开的文件开到右栏）；
+- 顶栏的**分屏按钮**（田字格图标）切换；
+- 右栏右上角一个**淡色 ✕**（悬停显示「关闭分屏」）关闭。
+- 中间的 **1px 发丝分隔条可拖动**调整左右比例（20%–80%，悬停变主题色）。
+- **点哪一栏，再点标签栏就切换那一栏的文件**（聚焦栏由其标签的强调色下划线标示，另一栏标签为淡色下划线）。
+
+**实现**（`App.jsx` + `styles/app.css`）：
+- `splitId` = 右栏显示的标签 id；`split` 为派生标志（右栏标签存在、且 ≠ 活动标签、且不在主页）；`focusedPane`（'left'/'right'）决定标签点击切换哪一栏。
+- 两栏是 `.editor-area`（flex 行）里的**同级兄弟**，靠每个标签的 `display` / `order` 控制显隐 —— **不重新挂载、不重复实例**，所以切换/开关分屏不会重建编辑器、不重新解析。
+- `splitRatio` + `.hm-split-divider`（`startSplitDrag` 按鼠标 x 算比例，给左栏设 `flex-basis`）。
+- `editorHostRef` 始终指向左/活动栏（查找、大纲、滚动比例都作用于它）；`focusedTabRef` 记录最后获得焦点的栏，让保存/导出作用于你正在编辑的那一栏。右栏不显示全局源码模式。
+- 聚焦提示走标签下划线（`.tab.active` 强调色 vs `.tab.active.split-peer` 淡色），编辑区不画任何额外色条，保持简约。
+- 大纲以最后聚焦的窗格为目标：点击左右编辑区会切换标题列表、滚动高亮和跳转目标；富文本容器按 tab id 注册，左栏源码与右栏富文本并存时也不会串文档（#66）。
+
+## 22. 统一的右键菜单（标签 / 文件树）
+
+标签页和侧边栏文件树的右键菜单提供**一致的文件操作**：在右侧分屏打开 · 复制文件路径 · 复制文件名 · 打开所在文件夹 · 重命名 · 创建副本 · 导出为 PDF（md）· 删除。标签页额外有 关闭 / 关闭其他；文件树额外有 新建文件 / 新建文件夹。未保存（无路径）的标签里，依赖路径的项自动置灰。
+
+**实现**（`Tabs.jsx` / `Sidebar.jsx` / `App.jsx`）：
+- 标签的文件操作（重命名 / 复制 / 删除 / 导出）在 `useFileOps.js`，复用与文件树相同的 IPC，完成后 bump `refreshNonce` 刷新树。
+- **重命名走自研的内联弹窗 `RenameModal`，不能用 `window.prompt`** —— Electron 渲染层不支持 `prompt()`（直接抛 "prompt() is not supported"，导致重命名静默失效）。`window.confirm` / `window.alert` 仍可用。
+- 复制路径/文件名用 `navigator.clipboard` + 一个 `hm:toast` 提示；"打开所在文件夹"走 `shell:showInFolder`。
+
+## 23. 复制按钮反馈
+
+代码块右上角的 **「复制」** 按钮通过 preload 的 `clipboard:writeText` 写入系统剪贴板，内容从当前 ProseMirror `code_block` 节点读取；只有写入成功后才会**闪一个绿色 ✓** 并弹出 **「已复制」** 轻提示。不能使用 `.cm-line` 作为回退：CodeMirror 会虚拟化长代码，DOM 通常只有当前可见的 30–65 行。DOM 位置定位失败时按代码块的文档顺序匹配完整 ProseMirror 节点，仍无法定位则不写剪贴板，也不显示成功。
+
+**实现**：`editor-dom-content.js` 在捕获阶段接管 `.copy-button`，阻止 Crepe 再调用权限不稳定的浏览器 Clipboard API；`ui.js` 统一走 Electron IPC（移动/浏览器构建回退标准 Clipboard API）。
+
+## 24. 未保存草稿跨重启恢复
+
+新建但没保存的临时文档（未命名标签），默认会在重启后恢复（标签带“已修改”红点）。用户可在“设置 → 通用 → 启动”关闭“恢复上次打开的文档”；关闭后历史文件和草稿均不自动恢复，但 OS/命令行显式打开路径仍由 `appReady` 队列正常交付。
+
+**实现**（`App.jsx`）：会话持久化里新增 `untitled: [{title, content}]`，只存**有内容且脏**的无路径标签（未动过的欢迎页/空白页不会反复回来）；启动时重建这些标签（`savedContent:''` 让它们保持"未保存"）。有路径的文件仍从磁盘重开。
+
+> 持久化**防抖 400ms**（并在关闭/刷新时兜底刷一次），避免大文档每敲一个字就整篇序列化写盘导致打字卡顿。
+
+**文档位置记忆（#111）**：恢复打开文档时，同时恢复上次的**光标与滚动位置**——长文档不必每次重开都重新滑到写作处。每个文档路径独立存一条 `{offset, len, scrollTop}`（`localStorage["horsemd.docpos.v1"]`，上限 300 条）：`offset` 是富文本光标或源码 textarea 光标的原始 Markdown 字符索引，`scrollTop` 是滚动容器的滚动位置；`len` 是保存时的文档长度，重开时**长度不一致（文件被外部改动）就不恢复**，避免把旧偏移映射到新内容上。
+
+**实现**：`hooks/useDocPositions.js` 在**切换标签**和**窗口关闭/刷新**时批量捕获所有已挂载文档的位置（切走的标签仍保留 ProseMirror 选区，可继续读取；纯滚动阅读用视口顶部偏移兜底），`lib/doc-positions.js` 防抖写入。打开文件时（`useFileOps`）读取记录并校验长度，富文本在 `onReady` 后用既有 `restoreMarkdownOffset(offset, false)` 恢复选区（不抢焦点），再同步设置滚动位置；重文档（源码 textarea）用 `setSelectionRange` + `scrollTop` 恢复。回归：`npm run test:doc-position-restore-ui`。
+
+## 25. 可配置图床（类 Typora 自定义命令）
+
+**右上角图片按钮**配置一条上传命令(如 `picgo upload`)。之后**粘贴 / 拖入 / 上传**图片会:把图片写到临时文件 → 运行 `<命令> "<临时文件>"` → 取它打印到 stdout 的图片 URL 插入文档。命令留空 = 保持默认(图片为本地引用,不拦截粘贴/拖入,避免插入刷新即失效的 `blob:`)。
+
+**实现**：`ImageHostButton.jsx`(顶栏 popover,`position:fixed` 避开顶栏 `overflow:hidden`;配置后图标带强调色小点)+ `Editor.jsx` 的 `onUpload` / 粘贴 / 拖放钩子(代码块内不拦截)+ 主进程 `image:upload` IPC(临时文件 + `exec` + 解析最后一个 http(s) URL)。命令存 `localStorage["horsemd.settings.v1"]`。
+
+## 26. 自定义页面宽度
+
+状态栏**页宽按钮** → 小弹窗:分段预设(窄 / 中 / 宽 / 全宽,选中胶囊滑动)+ 「微调」滑块(像素级)。
+
+**实现**：`StatusBar.jsx` 的 `PageWidthControl`;CSS 变量 `--editor-max-width` 驱动 `.editor-host` / `.source-editor` / 骨架屏宽度,「全宽」用 `body.hm-full-width` 类(源码模式靠 calc 居中,变量无法单独表达"无上限")。值存 settings.js。
+
+设置页无法直接展示真实 600–1400px 页面，因此 `TypographyControls.jsx` 会把实际宽度等比映射到预览画布的 440–680px；“全宽”占满画布。滑杆拖动时同时更新真实 CSS 变量与预览专用变量，松手后才持久化设置。不要再给预览正文增加低于预设范围的固定 `max-width`，否则多个预设会再次显示为相同宽度。
+
+## 27. Mermaid 图表 + LaTeX 公式
+
+- ` ```mermaid ` 代码块下方**实时渲染图表**(可编辑源码不变)。
+- 行内 `$…$`、块级 `$$…$$`(`$$` 单独成行)经 **KaTeX** 渲染;过长的显示公式在列内**横向滚动**,不溢出。
+- 行内公式支持两种实时编辑路径:直接输入未闭合 `$…` 时显示浮动预览;先输入 `$$` 再把光标移回中间补写时保留源码连续输入(纯数字也支持),离开后转为公式节点。点击已有行内公式再次编辑时,KaTeX 预览随源码逐字更新。
+- Mermaid/LaTeX 默认显示渲染预览；正在 CodeMirror 中输入时，即使预览首次出现也不会隐藏编辑器或抢走焦点，离开编辑后仍保持原来的紧凑预览。
+
+**实现**：Mermaid 走 Crepe 代码块自带的 **"preview" 机制**（与 LaTeX 同款）；Mermaid 和 LaTeX 都注册了 `renderPreview`，所以**链式分发**——`mermaid` 语言走我们的渲染器、其余（`latex` 等）回落到 Crepe 自带的，否则 mermaid 会把 `$$…$$` 盖掉回退成裸代码块（`editor-mermaid.js`，`mermaid` 动态 `import()` 懒加载，装饰 key 含渲染状态）。
+
+公式启用 `CrepeFeature.Latex`（默认关），KaTeX/latex 样式随主题 CSS 已打包；`.katex-display { overflow-x:auto }`。**单行 `$$x^2$$` 在解析前由 `normalizeDisplayMath`（`editor-math.js`）改写成块级多行形式**（`$$\nx^2\n$$`），否则 remark-math 会把 `$$` 压成单个 `$` 当行内公式（issue #18）。该函数幂等、代码安全（围栏代码块与行内代码先 stash，`$$` 只在"整行恰好是 `$$…$$`"时改），对行内 `$x$` 和行中 `text $$x$$ text` 不动。
+
+## 28. 自定义主题（可迁移 Typora 主题）
+
+把 `.css`(或整个下载来的主题文件夹)丢进**主题文件夹**,状态栏主题菜单的「自定义」区即可选用;另有「打开主题文件夹」「获取更多主题」(theme.typora.io)。Typora 主题可**直接迁移**。
+
+**实现**(`main` themes IPC + `customThemes.js` + `StatusBar.jsx`):`themes:list` **递归扫描**子目录(Typora 主题常是文件夹);`themes:read` 把相对 `url(...)` 改写成绝对 `file://`(字体/图能加载);CSS 注入到一个 `<style>`,编辑器内容带 Typora 的 `#write` / `markdown-body` 钩子;激活时(`body.hm-has-custom-theme`)正文区背景/宽度与文字 `color:inherit` 让位给主题,应用外壳保持自身风格;`applyTheme` 保留 `hm-*` body 类(切主题不丢全宽/自定义标记)。选择存于会话(`customTheme`)。
+
+## 29. 表格单元格内换行
+
+表格单元格内按 **Enter / Shift+Enter** 换行,保存为 `<br>`(GFM 表格仍是单行,**不损坏**),重开能正确解析回换行。新插入表格或通过表格手柄重复新增行列后，空单元格保持为正常的 `| |`；连续填写多个新单元格后切换源码或保存，内容仍留在各自单元格，不会合并到相邻列，也不会额外长出空行或空列。
+
+**实现**(`editor-tablebreak.js`,接入 `editor-crepe-setup.js`):keymap 在单元格内插入 hardbreak(渲染为 `<br>`);自定义 remark stringify `break` 处理器**仅在 `tableCell` 上下文**输出 `<br>`(其它走默认,段落换行不变);remark 解析插件把内联 `<br>` 转回 break(顺带修了"单元格 `<br>` 被丢")。Milkdown 需要用生成的 `<br />` 维持空单元格的列数，`markdown-source-preservation.js` 在完整表格规范化后才把“单元格唯一内容”的该标记转为 `| |`；真实 `text<br>text` 不会被改写。任何表格变更都采用本次完整规范 Markdown，不能再把表格结构当普通字符差分局部拼接。
+
+## 30. 表格排版优化
+
+Markdown 表格渲染更紧凑：去掉单元格内段落的 margin 和 Crepe 额外 padding，单元格内边距与行高使用 `em` 随文档字号等比变化，而不是保持固定像素高度；并对超列宽内容/行内代码自动换行（`word-break`），不再与相邻列重叠。PDF 打印表格采用同一套字号相对密度。
+
+短表保持内容优先的自然宽度并带有主题感知的轻微表体底色；未手动调宽时使用浏览器 `table-layout: auto`，综合表头和所有单元格内容为每一列分配不同宽度，而不是按首行把各列等分。只有确实超过正文宽度的 Markdown/HTML 表格才在自身横向滚动容器内滑动，不能撑开编辑器或应用页面。**设置 → 外观 → 表格 → 宽表自动换行** 会把 Markdown 与原生 HTML 表格的所有列收进当前正文宽度并自动换行；该模式会暂时忽略 Markdown 的手动列宽，避免历史列宽留下隐藏的横向滚动面。
+
+列边界的交互分两段：普通悬停继续交给 Crepe 的加行/加列控件；在边界按住约 220ms 后由 `editor-dom-layout.js` 的 `mountTableHandleBounds()` 进入调整模式，直接更新当前连接 table 的 `colgroup` 作为实时预览，再在松手时以一次 ProseMirror transaction 写入 `data-colwidth`。只有此时表格才切换为 `table-layout: fixed`，明确尊重用户指定的整组列宽。其 1px `.hm-column-resize-guide` 独立于 Crepe node view，且每次写入会恢复 wrapper 的 `scrollLeft`，因此最右列不应再跳回起点。
+
+表格单元格支持**单击直接进入编辑**（不再要求双击）：点击单元格即定位光标，双击仍保留选中文本行为。回归：`npm run test:table-click-edit-ui`。
+
+**验证**：`npm run test:table-ui` 在真实 Electron 中检查内容较长列必须明显宽于短内容列，并覆盖 12/16/24px 字号下的等比紧凑行高、浅/深主题、移动窄屏、宽表内部滚动、行列按钮、长按实时调宽、手动宽度持久化，以及宽表最右侧连续 10 次悬浮/调整时横向位置不回退。
+
+## 31. 设置页（一站式配置）
+
+- 左下角齿轮（ActivityBar）/ 移动端 ••• 打开设置标签页
+- **常规**：中文 / English；保存与恢复（自动保存、历史版本：已用空间、保留期、最近删除、清空）；桌面端还有**离线模式**
+- **编辑器**：英文拼写检查、源码单换行显示、桌面端选中文字浮动工具栏、行内公式删除等编辑行为
+- **外观**：6 套内置主题 + 自定义 Typora 主题，以及文档/代码字体、字号 / 行距 / 段距 / 标题间距 / 页宽、自定义 CSS、宽表自动换行和源码字号；顺序为主题、排版预览、自定义 CSS、表格、源码外观
+- **文件与图片**：显示隐藏文件、Typora 式自定义图床上传命令
+- **键盘快捷键**：展示全部首批命令，支持搜索、录制、清空、单项恢复默认、全部恢复默认、冲突提示和系统保留键提示
+- **关于**：版本号、手动检查更新、官网与仓库链接
+- 打开设置时侧栏自动收起；设置标签页不持久化（纯 transient）
+
+普通 Markdown 单换行会保留为 Milkdown 的 inline hardbreak 节点。默认开启“保留源码单换行”时，HorseMD 只在 CSS 层把该节点显示为换行；关闭后按 CommonMark 规则显示为空格。两种状态都不改变源码、节点位置或 PDF。Enter 仍创建标准段落，Shift+Enter 仍创建显式硬换行，不能把三种行为混合。
+
+**实现**：`SettingsView.jsx` 只做设置壳层和模块导航，具体页面在 `components/settings/`。`EditorSettings.jsx` 只拥有编辑行为；`AppearanceSettings.jsx` 编排主题与 `DocumentAppearanceSettings.jsx`，后者集中排版、CSS、表格和源码视觉设置。所有搬迁继续使用原 `settings` 键与 App 应用逻辑，不执行偏好迁移。`ui/Toggle.jsx` 提供 DNA 开关，`ui/AdjustGroup.jsx` 是排版共享控件，`settings.js` 保存 spellcheck / showHiddenFiles / selectionToolbar / preserveSoftBreaks 等 pref，并由 `applySoftBreakDisplay()` 切换纯显示 class。快捷键配置独立存储在 `localStorage["horsemd.keybindings.v1"]`，不污染文档 session；设置页激活时会阻断保存、查找、侧边栏等后台文档快捷键。
+
+## 31b. 离线模式（严格断网）
+
+设置 → 通用 → 联网 → **离线模式**。开启后桌面端不发起任何应用网络请求，已有网络连接会被中断，本地文件、历史版本、主题、查找、离线图片和本地导出继续可用。禁用的路径包括：
+
+- 启动/手动检查更新与更新下载
+- 云同步、自动同步、连接测试、远端工作区浏览/加入
+- 图床上传（自定义命令与 PicGo 本地 HTTP 服务；子进程会被终止）
+- Markdown 中的远程图片、音视频和 iframe
+- PDF/HTML 导出时抓取远程图片（降级为 unresolved image，本地图片照常嵌入）
+- 通过应用打开外部 http/https/mailto 链接
+
+状态栏显示「离线」；云同步设置页保持可读但操作不可用；粘贴/拖入图片自动走本地 `assets/` 保存，不会上传。
+
+**实现**：主进程 `src/main/offline.js` 是唯一权威状态，持久化在 `userData/offline-mode.json`，在渲染层挂载前读取。`installOfflineNetworkGuard(session)` 在 Chromium session 上取消 http/https/ws/wss 请求；`createElectronRequest`、`offlineFetch`、更新、同步、图床、导出和外链 IPC 再做一层 fail-closed 检查，未来网络功能也必须接入这一层。开启时停止正在运行的同步、取消更新下载、终止图床子进程并 `closeAllConnections()`。回归：`npm run test:offline-mode` 与 `npm run test:offline-mode-ui`。
+
+## 32. Mermaid 全屏灯箱
+
+- 点击渲染好的 Mermaid 流程图 → 全屏灯箱弹出
+- 按 SVG `viewBox` / 图片原始尺寸保持精确宽高比，不再强制固定方形画布
+- 顶部提供缩小 / 倍率 / 放大 / 适应窗口 / `1:1` 原始尺寸控制
+- **Ctrl+滚轮**缩放（0.2×–10×）+ **按住拖拽**平移
+- Esc / 点背景关闭；拖拽后的 click 不会误关
+
+**实现**：`editor-dom-bindings.js` 的 `onMermaidClick` 克隆 SVG，并从 `viewBox` 记录原始宽高；`editor-lightbox.js` 统一管理按钮、滚轮缩放、1:1 比例和拖拽。CSS 只做视口上限约束，不设置会改变长宽图展示画布的固定最小尺寸。初始社区实现来自 @digyear PR #27。
+
+## 33. 标签页拖拽排序
+
+- 按住标签左右拖 → 松手固定到新位置，顺序持久化（重启保持）
+- 拖拽时有 accent 色插入指示线；关闭按钮 / 右键菜单 / 中键关闭不受影响
+
+**实现**：`Tabs.jsx`（draggable + onDragStart/Over/Drop/End）+ `useFileOps.js` `reorderTabs(from,to)`。无新依赖。
+
+## 34. 拼写检查开关
+
+- 设置 → 校对 → Toggle（默认关）。仅作用于 `.ProseMirror` contenteditable；其它输入框始终 spellCheck={false}。跨 tab 一致 + 持久化。
+
+**实现**：`settings.js` `spellcheck:false`；`Editor.jsx` 给 `view.dom` 设 `spellcheck` 属性（mount + effect on change）。不需要 IPC。
+
+## 35. 文件树显示隐藏文件
+
+- 设置 → 外观 →「显示隐藏文件」开关（默认关）。开 → `.claude` / `.cursor` / `.github` 等出现；`.git` / `node_modules` 始终隐藏。
+
+**实现**：`main/index.js` `showHidden` 全局 + `settings:setShowHidden` IPC；`readTree` + `listFilesFlat` 检查它；`preload` + `App.jsx` useEffect 同步 + 刷新。
+
+## 36. 大纲跳转 + 模式切换位置保持
+
+**大纲跳转**（根治多轮）：
+- 点击大纲标题 → 自定义 **ease-out 动画**（200–500ms）→ **poll-and-stabilize**（每 200ms 检查，异步内容把位置漂了就重新跳，连续 2 次稳定才恢复锚定）
+- **forcedActiveRef**：跳转期间强制高亮点击的那条（scrollspy 的 tops 缓存可能过期）
+- 大文档分块加载中：不显示部分标题 + 排队跳转，加载完再跳
+- 根因：`overflow-anchor:auto`（#25 修复）和 `scrollIntoView` 打架 → 跳转时临时关锚定
+
+**模式切换位置保持**（#28 / #41 / #42）：
+- 源码模式显示 textarea 时，已激活的富文本 Crepe **保持挂载但隐藏**，未编辑源码时切回富文本不重新解析整篇文档，也不重新加载图片。
+- 阅读态（没有可见光标 / 光标离屏）优先保留视口；编辑态（可见光标）优先跟随光标并保证光标可见。
+- 源码改动只在 `sourceEditedIds` 标记后同步回富文本；普通视图切换不触发 dirty。
+- 光标映射不依赖关键词：Crepe 初始化规范化和真实编辑后都会同步当前 Markdown 快照，源码与富文本双向优先使用同一快照上的块级 raw offset。刚从源码恢复到富文本且用户没有移动/编辑时，会保留来源 raw offset，使连续往返严格可逆；全局可见字符索引、文本上下文和比例只作异常兜底。代码块进入 CodeMirror 后，按真实 `.cm-line` DOM selection 计算块内源码位置，并用 caret rect 保证光标可见。阅读态视口采用 textarea 像素位置、可见字符索引和 ProseMirror 坐标组合映射，避免图片在源码和富文本中高度不同造成的非线性漂移。
+- 表格坐标映射会把 ProseMirror `table_cell` 内部的 paragraph 归类为 Markdown `tableCell`,再按单元格文本和块内字符定位；普通单元格文字、重复内容和反引号内联代码不会退化成全文段落序号匹配。
+
+## 37. 代码块跳页根治（#25 最终修复）
+
+- 滚到代码块、停下、选中文字 → 内容**不再上蹿**（纯滚动 / 选区 / 代码块组合全部不跳）
+
+**根因**：Milkdown `CodeMirrorBlock` node view 懒挂载（IntersectionObserver 200px + 5s teardown）→ placeholder↔mounted 高度差（127px）+ Chromium 选区时禁用 `overflow-anchor` → 跳。
+
+**修复**：`editor-codeblock-eager.js`（prototype 修改 `CodeMirrorBlock`）：`renderPlaceholder`→立即 `initializeCodeMirror`（打开即挂载）+ `scheduleTeardown`→no-op（永不卸载）。高度恒定 → delta=0 → 无论纯滚动还是选区都不跳。带 API 漂移 guard。
+
+## 38. 插入附件（非图片文件）
+
+`文件 → 插入附件…` 或命令面板「插入附件…」可选择 PDF、DOCX、ZIP、音频等任意普通文件。HorseMD 不预览附件，只把它们复制到当前 Markdown 文件同级的 `assets/` 文件夹，并在光标处插入普通 Markdown 链接：
+
+```md
+[report.pdf](<assets/report.pdf>)
+```
+
+**实现**（desktop only）：
+- 主进程 `dialog:openAttachments` 打开多选文件选择器；`attachment:save` 校验文件、创建 `assets/`、去重命名并复制文件。
+- 渲染层 `attachFiles()` 先要求当前文档已保存，再按当前源码/富文本模式插入链接；源码模式写 textarea selection，富文本模式用当前 Markdown offset 插入。
+- `window.api.capabilities.fileAttachments` 控制入口显示；移动端 shim 返回 unsupported，避免出现不可用 UI。
+
+## 39. 代码块行号（编辑器 + PDF）
+
+代码块左侧显示**行号**，与代码内容对齐：
+
+- **编辑器内**：行号列背景不透明（与代码块同色，明暗主题一致），贴住代码块左边缘，行号数字与代码行等高（字号 `1em`、`line-height: 1.6`），右侧 1px 分隔竖线。行号不可选中（`user-select: none`）。
+- **导出 PDF**：代码块每行带行号（浅色、右对齐），与编辑器内一致（issue #109）。
+- 长代码块行号随内容滚动，两位数/三位数行号列宽自动适配。
+
+**实现**（`styles/app.css`）：`.cm-gutters` / `.cm-lineNumbers .cm-gutterElement`（编辑器）；`pdf-print-styles.js` 的 `.hm-code-line-num`（PDF）。代码块行号必须贴左：`.cm-scroller` 左右 padding 归零、呼吸空间移到 `.cm-content`；行号全高靠 `font-size: 1em` + 显式 `line-height: 1.6`（CodeMirror 默认 `height: 100%` 在 flex 下可能解析为 0，不要依赖默认行盒）。
+
+回归：`npm run test:issue-91-pdf-ui`（PDF 行号）、`npm run test:issue-80-ui`（代码块间距）、`npm run test:codeblock-scroll-stability-ui`（滚动稳定）。
+
+## 40. 文档位置记忆（#111）
+
+重开文档时恢复到上次的**光标与滚动位置**，长文档不必每次重新滑到写作处：
+
+- 富文本：恢复上次光标所在段落，视口回到保存时的滚动位置（打开时不抢焦点，点击正文即可继续编辑）。
+- 重文档/源码模式（纯文本 textarea）：恢复光标字符位置 + 滚动位置。
+- **安全**：每条记录带文档长度指纹；文件被外部修改（长度变化）后不套用旧位置，从顶部打开。
+
+**实现**：`hooks/useDocPositions.js` 在切换标签、关窗/刷新时批量捕获位置（`lib/doc-positions.js`，`localStorage["horsemd.docpos.v1"]`，上限 300 条、防抖写盘）；`useFileOps` 打开文件时校验长度并挂载恢复参数；富文本用 `restoreMarkdownOffset(offset, false)` + 同步 `scrollTop`，textarea 用 `setSelectionRange` + `scrollTop`。
+
+回归：`npm run test:doc-position-restore-ui`（真实 app 同 profile 重启验证富文本视口 + 重文档光标/滚动均恢复）。
+
+## 快捷键一览
+
+大部分应用快捷键可在 **设置 → 键盘快捷键** 中自定义。HorseMD 使用统一命令注册表生成设置页、命令面板 hint、工具提示和 Electron 菜单 accelerator；renderer 快捷键和菜单 IPC 都走同一份有效键位。无修饰单字母、`Enter`、`Tab`、`Esc`、复制/粘贴/撤销等保留键不能录制。
+
+| 操作 | 快捷键 |
+| --- | --- |
+| 新建 / 打开文件 / 打开文件夹 | `Ctrl/Cmd+N` / `Ctrl/Cmd+O` / `Ctrl/Cmd+Shift+O` |
+| 保存 / 另存为 | `Ctrl/Cmd+S` / `Ctrl/Cmd+Shift+S` |
+| 导出为 PDF | `Ctrl/Cmd+Shift+E` |
+| 关闭标签 / 循环标签 | `Ctrl/Cmd+W` / `Ctrl+Tab` |
+| 命令面板 / 查找 | `Ctrl/Cmd+P` / `Ctrl/Cmd+F` |
+| 侧边栏 / 大纲 | `Ctrl/Cmd+Shift+B` / `Ctrl/Cmd+Shift+L` |
+| 源码模式 / 主题 | `Ctrl/Cmd+/` / `Ctrl/Cmd+Shift+T` |
+| 标题层级 / 正文 | `Ctrl/Cmd+1`…`6` / `Ctrl/Cmd+0` |
+
+> 注：`Ctrl/Cmd+B` 使用编辑器的标准加粗行为；侧边栏使用 `Ctrl/Cmd+Shift+B`。
+
+---
+
+## 41. 文档 / 代码字体设置（#38）
+
+### 怎么用
+
+设置 → 外观 → 排版中的两个选择器：**文档字体**（`--font-write`，影响正文 + 标题）和**代码字体**（`--font-mono`，影响代码块）。空 = 默认栈。相同页面还提供字号、行间距、段落间距、标题间距、页面宽度、源码字号和自定义 CSS。
+
+自定义 CSS 采用可组合的命名片段：每个片段可独立启停、重命名、排序和删除；启用的片段按列表顺序层叠，后面的规则可覆盖前面的规则。旧版单个 CSS 文本会自动迁移为第一个片段。设置预览使用真实编辑器的 `.milkdown .ProseMirror` 选择器，并覆盖标题、强调、删除线、链接、行内代码、`kbd`、引用、普通/有序/任务列表、表格和代码块；切换文档再回到设置时，当前 CSS 片段仍由 App 的临时 `settingsViewState.activeCssSnippetId` 选中，不写入偏好或会话。桌面端可从片段底部的“检查编辑器”打开现有 DevTools 来查看真实选择器；该入口不向 renderer 暴露 Node 权限。
+
+### 交互
+
+- 点击字段 → 弹出**搜索 + 列表**，优先显示完整字体名；名称过长时可通过原生 tooltip 查看完整内容。
+- **鼠标悬停** → 预览 + 编辑器**实时变成**那个字体（不用点击）。
+- 点击 → 设为该字体并关闭；空 = "默认"。
+- 列表底部有外部链接：文档字体 → [方正字库](https://www.foundertype.com/)（国内官方），代码字体 → [Nerd Fonts](https://www.nerdfonts.com/)。
+- 行距和段距同时作用于普通段落、无序列表、有序列表和嵌套列表；仅改变显示，不改写 Markdown 源码。
+- **列表类型转换（桌面富文本）**：右键普通列表的任意层级，悬停“列表”子菜单后可在有序/无序之间转换，或转为待办清单；待办清单也可显式转为有序或无序列表，并移除勾选状态。操作仅改变当前列表容器及其直接项目，父层和嵌套子层保持原样；列表菜单不显示无法作用的正文/标题项。正文段落的“转换为”子菜单也提供有序、无序和待办清单，命令以右键命中的 ProseMirror 位置为准，不会误改之前光标所在段落。列表转换在 dispatch 前建立确定快照，只替换当前层 marker/checkbox；未操作层级的缩进、空行、marker 和文字逐字节保留，转换后立即输入、切源码、保存重开也不会退回整棵 canonical 序列化。
+- **任务清单状态持久化**：点击任务方框时，Crepe 在 `pointerdown` 阶段通过节点属性事务切换 `checked`。`editor-dom-interactions.js` 必须在编辑器根节点的 capture 阶段记录这次用户编辑，因为 Crepe 随后会阻止兼容 `mousedown`；这样既有 `markdownUpdated`、原文保真和保存链路才能接收变化。勾选与取消勾选只写回目标项的 `[ ]` / `[x]`，保存并重开后状态保持。
+
+### 怎么实现
+
+- `settings.fontWrite` / `settings.fontMono` 存在 `localStorage`，通过 `fontStack(name, base)` 组合成 CSS font-family 栈。
+- 在 `App.jsx` 以 **inline CSS var** 设到 `.app` 根元素（`--font-write` / `--font-mono`），覆盖 `body.light/dark` 的默认值 + Windows 的 `.app.is-win` Consolas 覆盖。
+- **悬停预览**：`hoverFont` state 在 `App.jsx`，FontPicker 的 `onHover` 回调临时覆盖 settings 值 → 预览 + 编辑器实时变。
+- **queryLocalFonts**（Local Font Access API）枚举系统字体，权限在 `main/index.js` 的 `session.setPermissionRequestHandler` 授权。
+- **CodeMirror 字体修复**：CM 默认主题把 `.cm-content` 钉死 `monospace`，app.css 用高特异性规则 `.milkdown .cm-editor .cm-content { font-family: var(--font-mono) }` 覆盖 —— 这是 #34 弯引号 + #38 代码字体能生效的前提。
+- **设置预览**：`.settings-preview` 必须显式设 `font-family: var(--font-write)`（否则继承 body 的 `--font-ui` 界面字体，不反映文档字体变化）。
+
+---
+
+## 42. 文件夹级云同步（WebDAV / S3）
+
+桌面端可以把用户明确选择的文件夹原地纳入云同步。文件不迁移、不转换格式；Markdown、图片和附件仍是普通磁盘文件。首次上传选择“上传本地到云端”，第二台设备选择“从云端下载到本地”；完成基线后才使用日常“双向同步”。远端 manifest 被清空或替换时会进入恢复选择，绝不自动删除本地文件。
+
+**实现**：
+
+- `src/main/sync-workspaces.js` 管根目录隐藏标记 `.horsemd/workspace.json` 与应用私有登记表；不会扫描其他文件夹，禁止把系统根目录登记为同步根。
+- `src/main/sync-service.js`、`sync/sync-engine.js`、`sync/sync-plan.js` 分别负责 IPC 服务、执行器与纯同步决策；`.horsemd`、`.git`、`node_modules` 和符号链接不会作为用户内容上传。
+- `sync/webdav-provider.js` 使用 Electron `net.fetch`，支持 PROPFIND、条件 PUT、GET、DELETE；PUT 缺少 ETag 的 Apache DAV 会补一次 PROPFIND 获取 revision。
+- `sync/s3-provider.js` 使用 SigV4，不手写签名；工作区远端前缀固定为 `HorseMD/<workspaceId>/`，文件保持原相对路径，`.horsemd/` 存放同步元数据。旧版 `HorseMD/v1/workspaces/<workspaceId>/` 会继续被识别。对部分 MinIO 的首次 `If-None-Match` 兼容差异，只有确认对象仍不存在时才进行一次无条件创建回退。
+- 连接密码和 S3 Secret 保存在 Electron `safeStorage` 加密的应用数据中，不写入工作区、manifest、localStorage 或设置 JSON；可选 `userAgent` 是公开连接配置，限制为最多 256 字符且禁止换行，并同时传给 WebDAV/S3 请求。移动端 shim 明确关闭 `cloudSync` 能力，尚未提供假入口。
+- 冲突保留双方版本；同步删除进入本地或远端 `.horsemd/trash/`，不直接永久删除。
+
+**验证**：`test-sync-plan`、`test-sync-engine`、`test-sync-workspaces`、`test-sync-credentials`、`test-webdav-provider`、`test-webdav-apache`、`test-webdav-electron-sync`、`test-s3-provider`、`test-s3-electron-sync`。其中后两条真实服务测试分别使用本机 Apache DAV 与 MinIO，以及两个隔离 Electron profile。

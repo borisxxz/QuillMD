@@ -1,0 +1,56 @@
+import { useState } from 'react'
+import { resolveUpdateCheckState } from '../../lib/settings-update.js'
+
+export default function UpdateChecker({ t, offline = false }) {
+  const [status, setStatus] = useState('idle')
+  const [info, setInfo] = useState(null)
+
+  const run = async () => {
+    setStatus('checking')
+    try {
+      const r = await window.api.checkUpdate()
+      const next = resolveUpdateCheckState(r)
+      setInfo(next.info)
+      setStatus(next.status)
+    } catch {
+      setInfo(null)
+      setStatus('error')
+    }
+  }
+
+  return (
+    <div className="settings-row settings-update-row">
+      <div className="settings-row-text">
+        <div className="settings-row-label">{t('settings.updateTitle')}</div>
+        <div className="settings-row-desc settings-update-status">
+          {status === 'checking' && t('settings.checking')}
+          {status === 'uptodate' && t('settings.upToDate')}
+          {status === 'available' && info && (
+            <span>
+              {t('settings.newVersionAvailable', { v: info.latest })}
+              {info.download && <>
+                {' · '}
+                <button className="settings-inline-link" onClick={() => window.dispatchEvent(new CustomEvent('hm:update-download', { detail: info }))}>
+                  {t('update.direct')}
+                </button>
+              </>}
+              {' · '}
+              <button className="settings-inline-link" onClick={() => info.url && window.api.openExternal(info.url)}>
+                {info.download ? t('update.github') : t('update.download')} →
+              </button>
+            </span>
+          )}
+          {status === 'error' && t('settings.checkFailed')}
+          {offline && t('settings.offlineHint')}
+        </div>
+      </div>
+      <button
+        className="settings-link-btn"
+        onClick={run}
+        disabled={offline || status === 'checking'}
+      >
+        {offline ? t('status.offline') : status === 'checking' ? t('settings.checking') : t('settings.checkUpdate')}
+      </button>
+    </div>
+  )
+}

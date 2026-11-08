@@ -1,0 +1,1789 @@
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import SidebarPanes from './components/SidebarPanes.jsx'
+import { syncSummary } from './lib/sync-status.js'
+import Outline from './components/Outline.jsx'
+import GlobalSearchPanel from './components/GlobalSearchPanel.jsx'
+import FloatingOutline from './components/FloatingOutline.jsx'
+import StatusBar from './components/StatusBar.jsx'
+import SaveFab from './components/SaveFab.jsx'
+import CommandPalette from './components/CommandPalette.jsx'
+import { Icon } from './components/icons.jsx'
+import { THEMES, DEFAULT_THEME, applyTheme } from './themes.js'
+import { I18nProvider, translate, DEFAULT_LANG } from './i18n.jsx'
+import Welcome from './components/Welcome.jsx'
+import SettingsView from './components/SettingsView.jsx'
+import ActivityBar from './components/shell/ActivityBar.jsx'
+import Topbar from './components/shell/Topbar.jsx'
+import FindBar from './components/shell/FindBar.jsx'
+import EditorArea from './components/shell/EditorArea.jsx'
+import DropOpenOverlay from './components/shell/DropOpenOverlay.jsx'
+import UpdateToast from './components/UpdateToast.jsx'
+import { useUpdateDownload } from './hooks/useUpdateDownload.js'
+import RenameModal from './components/RenameModal.jsx'
+import SyncReportDialog from './components/SyncReportDialog.jsx'
+import HistoryDialog from './components/HistoryDialog.jsx'
+import DeletedFilesDialog from './components/DeletedFilesDialog.jsx'
+import { historySupported, openDeletedFiles, openFileHistory } from './lib/history-ui.js'
+import {
+  loadSettings,
+  saveSettings,
+  applyPageWidth,
+  applyFontSize,
+  applySourceFontOffset,
+  applyLineHeight,
+  applyParagraphSpacing,
+  applyHeadingSpacing,
+  applyTableAutoWrap,
+  applySoftBreakDisplay,
+  fontStack,
+  writeFontStack,
+  DEFAULT_FONT_MONO,
+  SYNC_AUTO_SAVE_DELAY
+} from './settings.js'
+import {
+  getTextareaSourceValue,
+  setTextareaSourceValue
+} from './source-text-fidelity.js'
+import { isTabDirty } from './lib/tab-state.js'
+import { applyCustomTheme, applyUserCss } from './customThemes.js'
+import { fireToast } from './ui.js'
+import { useFindReplace } from './hooks/useFindReplace.js'
+import { useGlobalSearch } from './hooks/useGlobalSearch.js'
+import { useOutline } from './hooks/useOutline.js'
+import { useOutlineFolds } from './hooks/useOutlineFolds.js'
+import { useAppLifecycle } from './hooks/useAppLifecycle.js'
+import { useColDrag } from './hooks/useColDrag.js'
+import { useFileOps } from './hooks/useFileOps.js'
+import { useAutoSave } from './hooks/useAutoSave.js'
+import { useImmersiveMode } from './hooks/useImmersiveMode.js'
+import { useReadingMode } from './hooks/useReadingMode.js'
+import { useSourceModeSwitch } from './hooks/useSourceModeSwitch.js'
+import { useDocPositions } from './hooks/useDocPositions.js'
+import { useSplitSourceRichSync } from './hooks/useSplitSourceRichSync.js'
+import { useSplitScrollSync } from './hooks/useSplitScrollSync.js'
+import { useAttachments } from './hooks/useAttachments.js'
+import { useSyncWorkspaces } from './hooks/useSyncWorkspaces.js'
+import { useAutoSync } from './hooks/useAutoSync.js'
+import { usePdfExport } from './hooks/usePdfExport.js'
+import { useHtmlExport } from './hooks/useHtmlExport.js'
+import { usePandocExport } from './hooks/usePandocExport.js'
+import { useKeybindings } from './hooks/useKeybindings.js'
+import { useSystemColorScheme } from './hooks/useSystemColorScheme.js'
+import { useDropOpen } from './hooks/useDropOpen.js'
+import { buildElectronAcceleratorPayload, buildGlobalAcceleratorPayload } from './lib/commands/electron-accelerators.js'
+import { createMenuHandlers, useGlobalKeys, useCommands } from './lib/menuHandlers.js'
+import { isAbsolutePath, isPlainTextDoc, loadSession, loadFolderRootsFromSession } from './paths.js'
+import { createReviewActions } from './lib/reviewActions.js'
+import { createEditorApiRegistry } from './lib/editor-api-registry.js'
+import { moveHeadingSection } from './outline-reorder.js'
+
+// Outline / file-tree pane drag bounds (px) — single source for the state init,
+// the drag clamp, and the double-click reset. CSS max-width on .pane-left must
+// stay >= PANE_MAX.
+const PANE_MIN = 160
+const PANE_MAX = 560
+const PANE_DEFAULT = 260
+
+const PdfExportStudio = __MOBILE_BUILD__
+  ? null
+  : lazy(() => import('./components/pdf-export/PdfExportStudio.jsx'))
+const HtmlExportStudio = __MOBILE_BUILD__
+  ? null
+  : lazy(() => import('./components/html-export/HtmlExportStudio.jsx'))
+const PandocExportStatus = __MOBILE_BUILD__
+  ? null
+  : lazy(() => import('./components/pandoc-export/PandocExportStatus.jsx'))
+
+export default function App() {
+  const session = useRef(loadSession()).current
+  // Migrate + sanitize the session's workspace folder roots once (stable session).
+  // Legacy single-folder and short-lived multi-workspace sessions are flattened.
+  const initialFolderRoots = useRef(loadFolderRootsFromSession(session)).current
+  // Mobile (Capacitor) builds run the same renderer; a few affordances differ
+  // (drawer sidebar, no split/image-host buttons). Desktop is unaffected.
+  const isMobile = window.api.platform === 'ios' || window.api.platform === 'android'
+  const [tabs, setTabs] = useState([])
+  const [activeId, setActiveId] = useState(null)
+  // On phones the sidebar overlays the editor, so it starts closed to keep the
+  // writing surface front-and-center (desktop keeps its previous default).
+  const [sidebarOpen, setSidebarOpen] = useState(session.sidebarOpen ?? !isMobile)
+  const [sidebarMode, setSidebarMode] = useState(session.sidebarMode || 'files') // 'files' or 'outline'
+  // Left-pane (outline / file-tree) width — draggable on hover (#resizable-pane).
+  // Persisted in session; .pane-left reads it via the --pane-left-w CSS var.
+  const [paneWidth, setPaneWidth] = useState(
+    Math.max(PANE_MIN, Math.min(PANE_MAX, session.paneWidth ?? PANE_DEFAULT))
+  )
+  const [theme, setTheme] = useState(session.theme || DEFAULT_THEME)
+  // Active custom CSS theme (filename in userData/themes), or null. Overlays the
+  // built-in base theme. `customThemes` is the list scanned from that folder.
+  const [customTheme, setCustomTheme] = useState(session.customTheme || null)
+  const [customThemes, setCustomThemes] = useState([])
+  const [lang, setLang] = useState(session.lang || DEFAULT_LANG)
+  const [recents, setRecents] = useState(session.recents || [])
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  // "Home" shows the welcome/landing page while keeping open tabs mounted (so
+  // returning to a document doesn't re-create its editor). Cleared whenever a
+  // tab is activated or a file is opened.
+  const [home, setHome] = useState(false)
+  // Split view: id of the tab shown in the right pane (null = no split). The left
+  // pane always shows the active tab; the right pane shows this one. A second,
+  // independent editor — both panes are fully editable. Driven by the tab
+  // right-click menu ("Open in Split") and the top-bar toggle.
+  const [splitId, setSplitId] = useState(null)
+  // Fraction of the editor area given to the left pane (0..1), dragged via the
+  // divider between the two panes.
+  const [splitRatio, setSplitRatio] = useState(0.5)
+  // One document shown as source (left) + rich preview (right). This remains
+  // separate from splitId, which represents two different documents.
+  const [sourceRichSplitId, setSourceRichSplitId] = useState(null)
+  const [sourceRichSplitRatio, setSourceRichSplitRatio] = useState(0.45)
+  const [sourceRichFocusedPane, setSourceRichFocusedPane] = useState('source')
+  // Which split pane is focused ('left' = active tab, 'right' = split tab). A tab
+  // click loads into the focused pane, so both panes are switchable from the one
+  // tab strip. Always 'left' when not split.
+  const [focusedPane, setFocusedPane] = useState('left')
+  // Rename-from-tab-menu modal: { id, value } or null. (Electron has no
+  // window.prompt, so renaming a tab's file uses this small inline dialog.)
+  const [renameState, setRenameState] = useState(null)
+  // Mobile "save as": prompt for a filename before writing an untitled doc into
+  // the local library (desktop uses the native save dialog instead).
+  const [saveNameState, setSaveNameState] = useState(null)
+  // User preferences (page width, image-host command). Persisted separately from
+  // the session; see settings.js.
+  const [settings, setSettings] = useState(loadSettings)
+  // Main owns offline-mode persistence; this marks when its authoritative value
+  // has been merged into the renderer mirror (before that, do not push localStorage).
+  const [offlineStateSynced, setOfflineStateSynced] = useState(false)
+  // Settings tabs are intentionally transient, but the user's current place in
+  // the settings workspace should survive switching to a document and back.
+  // This is UI-only state, so it must not be written into preferences/session.
+  const [settingsViewState, setSettingsViewState] = useState({
+    activeSection: 'editor',
+    activeCssSnippetId: null
+  })
+  const systemIsDark = useSystemColorScheme()
+  const followsSystemTheme = settings.themeMode === 'system'
+  const effectiveTheme = followsSystemTheme
+    ? (systemIsDark ? settings.systemDarkTheme : settings.systemLightTheme)
+    : theme
+  // Read-only documents: the mobile lock (Capacitor builds only) or the
+  // desktop reading mode (#163). Each platform reads only its own setting, so
+  // shared preferences never carry one platform's lock to the other.
+  const mobileReadOnly = isMobile && settings.mobileReadOnly
+  const readingMode = !isMobile && settings.readingMode === true
+  const readOnly = mobileReadOnly || readingMode
+  const offlineMode = settings.offlineMode === true
+
+  const editorHostRef = useRef(null) // active rich editor's scroll container
+  // Every mounted rich editor's scroll container, keyed by tab id. Split-view
+  // outline navigation uses this without repointing editorHostRef, which remains
+  // the source/find/mode-switch contract for the active left tab.
+  const editorHosts = useRef({})
+  // Whether auto-save is on (set by useAutoSave below; read by an explicit
+  // save: Cmd/Ctrl+S then keeps a history version and hints once or twice).
+  const autoSaveActiveRef = useRef(false)
+  const editorAreaRef = useRef(null) // flex row holding the editor panes (for split-drag math)
+  const richLoadingRef = useRef(false) // live mirror of richLoading (chunked large-doc load) for the mode-switch effect
+  const findStateRef = useRef({ open: false, query: '' }) // live find bar state for the mode switch (who owns the caret)
+  const findSwitchOwnerRef = useRef(null) // one-shot: toggleSource → useFindReplace, does find or the caret own this switch
+  // Registry of each tab's editor API (by tab id). Several markdown editors can
+  // be mounted at once (a tab stays mounted after its first activation), so a
+  // single ref would get stuck on whichever editor mounted last; keying by tab
+  // id lets commands act on the *currently active* document.
+  const editorApiRegistryRef = useRef(null)
+  if (!editorApiRegistryRef.current) editorApiRegistryRef.current = createEditorApiRegistry()
+  const editorApiRegistry = editorApiRegistryRef.current
+  const editorApis = editorApiRegistry.ref
+  const registerEditorApi = editorApiRegistry.register
+  const waitForEditorApi = editorApiRegistry.waitFor
+  // The tab id of whichever editor pane last had focus — so Save / Export target
+  // the pane you're actually editing in split view, not always the left one.
+  const focusedTabRef = useRef(null)
+  const [activeBlock, setActiveBlock] = useState('paragraph')
+  // Lazy mounting: a rich (Crepe) editor is only created once its tab has been
+  // activated, then kept mounted so later tab switches stay instant. This keeps
+  // startup/session-restore fast — only the active tab spins up an editor
+  // instead of every restored tab parsing its whole document at once.
+  const [mountedIds, setMountedIds] = useState(() => new Set())
+  // Chunked rich-document loading is tracked per tab. Hidden editors stay
+  // mounted, so a single boolean lets one tab incorrectly mask another.
+  const [richLoadingIds, setRichLoadingIds] = useState(() => new Set())
+  const setTabRichLoading = useCallback((id, loading) => {
+    setRichLoadingIds((prev) => {
+      const has = prev.has(id)
+      if (has === loading) return prev
+      const next = new Set(prev)
+      if (loading) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }, [])
+  // Tab ids the user explicitly chose to render richly despite being "heavy"
+  // (would otherwise open in the fast plain-text editor to avoid a long freeze).
+  const [richForced, setRichForced] = useState(() => new Set())
+
+  const activeTab = useMemo(() => tabs.find((t) => t.id === activeId) || null, [tabs, activeId])
+  const activePath = activeTab?.path || null
+  // Opening the Settings tab auto-closes the sidebar (outline/files) so the
+  // settings page gets full width — the settings page has its own section jump-bar.
+  useEffect(() => {
+    if (!home && activeTab?.kind === 'settings') setSidebarOpen(false)
+  }, [home, activeTab, setSidebarOpen])
+  // Split is "live" only when the right-pane tab exists and differs from the
+  // active (left) one. Hidden on the welcome/home screen.
+  const splitTab = useMemo(
+    () => (splitId != null ? tabs.find((t) => t.id === splitId) || null : null),
+    [tabs, splitId]
+  )
+  const split = !home && !!splitTab && splitId !== activeId
+  const sourceRichSplitMode = !isMobile && !home && !split && sourceRichSplitId === activeId
+  // Always-current activeId for callbacks that fire after a tab switch.
+  const activeIdRef = useRef(activeId)
+  activeIdRef.current = activeId
+
+  // Always-current snapshot of tabs for use inside async callbacks / event
+  // handlers that must not capture a stale `tabs` closure.
+  const tabsRef = useRef(tabs)
+  tabsRef.current = tabs
+  // Uncontrolled-textarea live edits. The heavy/plain-doc <textarea> is rendered
+  // with defaultValue (not value) so typing doesn't re-render App and re-set a
+  // multi-MB value each keystroke — that was the ~218ms/keystroke lag on a 1.28MB
+  // file. Edits land in liveContentRef and are committed to tab.content on a 400ms
+  // debounce, OR synchronously via commitAllLive() before any critical read (save /
+  // close / session / external-reload) — so edits inside the debounce window are
+  // never lost. Only the textarea path uses this; rich editors still call
+  // updateContent() directly (they have no per-keystroke value re-set cost).
+  const liveContentRef = useRef(new Map()) // tab id → latest textarea value (uncommitted)
+  const liveTimersRef = useRef(new Map()) // tab id → debounce timer
+  // Commit one tab's pending textarea edit. Updates the synchronous tabsRef
+  // mirror FIRST (confirmAppClose / saveTab read it), then queues setTabs so
+  // render-time readers (StatusBar, SaveFab) catch up on the next paint.
+  const commitLive = useCallback((id) => {
+    if (!liveContentRef.current.has(id)) return
+    const content = liveContentRef.current.get(id)
+    const timer = liveTimersRef.current.get(id)
+    if (timer) clearTimeout(timer)
+    liveTimersRef.current.delete(id)
+    liveContentRef.current.delete(id)
+    const current = tabsRef.current.find((t) => t.id === id)
+    if (current?.content === content) return
+    tabsRef.current = tabsRef.current.map((t) => (t.id === id ? { ...t, content } : t))
+    setTabs((prev) => prev.map((t) => (t.id === id && t.content !== content ? { ...t, content } : t)))
+  }, [])
+  const commitAllLive = useCallback(() => {
+    for (const id of [...liveContentRef.current.keys()]) commitLive(id)
+  }, [commitLive])
+
+  const t = useCallback((key, vars) => translate(lang, key, vars), [lang])
+  // Always-current translator for stable callbacks (for example source/save
+  // boundaries and openPaths) that must not be recreated on language changes.
+  const tRef = useRef(t)
+  tRef.current = t
+
+  const {
+    sourceMode,
+    sourceRef,
+    sourceTextareas,
+    sourceEditedIds,
+    toggleSource
+  } = useSourceModeSwitch({
+    tabs,
+    activeId,
+    setTabs,
+    tabsRef,
+    activeIdRef,
+    editorApis,
+    liveContentRef,
+    editorHostRef,
+    focusedTabRef,
+    commitAllLive,
+    findStateRef,
+    findSwitchOwnerRef,
+    richLoadingRef,
+    tRef
+  })
+
+  // Persist per-document caret/viewport so reopening a file (session restore or
+  // manual) returns to the last edit position instead of the top (issue #111).
+  useDocPositions({
+    tabsRef,
+    activeId,
+    editorApis,
+    sourceTextareas,
+    editorHosts
+  })
+
+  const {
+    previewState: richPreviewState,
+    onSourceInput,
+    onSourceCompositionStart,
+    onSourceCompositionEnd
+  } = useSplitSourceRichSync({
+    enabled: sourceRichSplitMode,
+    activeId,
+    tabs,
+    tabsRef,
+    setTabs,
+    editorApis,
+    sourceTextareas,
+    sourceEditedIds,
+    liveContentRef,
+    liveTimersRef,
+    commitLive
+  })
+
+  // The existing rich/source control remains an exclusive mode switch. From a
+  // source+preview screen it first exits the dual-pane layout, then enters the
+  // requested single source/rich mode; otherwise the rich pane would be hidden
+  // while the “Source + preview” control still appeared active.
+  const toggleSourceView = useCallback(() => {
+    if (sourceRichSplitMode) setSourceRichSplitId(null)
+    toggleSource()
+  }, [sourceRichSplitMode, toggleSource])
+
+  useSplitScrollSync({
+    enabled: sourceRichSplitMode,
+    activeId,
+    sourceTextareas,
+    editorHosts,
+    editorApis
+  })
+
+  useEffect(() => {
+    if (sourceRichSplitId && !tabs.some((tab) => tab.id === sourceRichSplitId)) {
+      setSourceRichSplitId(null)
+    }
+  }, [sourceRichSplitId, tabs])
+
+  // Drop editor APIs for tabs that have closed.
+  useEffect(() => {
+    const live = new Set(tabs.map((t) => t.id))
+    editorApiRegistry.prune(live)
+    // Forget mount records for closed tabs (so the Set doesn't grow unbounded).
+    setMountedIds((prev) => {
+      let changed = false
+      const next = new Set()
+      for (const id of prev) {
+        if (live.has(id)) next.add(id)
+        else changed = true
+      }
+      return changed ? next : prev
+    })
+    setRichForced((prev) => {
+      if (!prev.size) return prev
+      let changed = false
+      const next = new Set()
+      for (const id of prev) {
+        if (live.has(id)) next.add(id)
+        else changed = true
+      }
+      return changed ? next : prev
+    })
+    setRichLoadingIds((prev) => {
+      if (!prev.size) return prev
+      const next = new Set([...prev].filter((id) => live.has(id)))
+      return next.size === prev.size ? prev : next
+    })
+  }, [tabs, editorApiRegistry])
+
+  useEffect(() => () => editorApiRegistry.dispose(), [editorApiRegistry])
+
+  // Mark the active tab as mounted (and keep it mounted thereafter).
+  useEffect(() => {
+    if (activeId == null) return
+    setMountedIds((prev) => (prev.has(activeId) ? prev : new Set(prev).add(activeId)))
+  }, [activeId])
+
+  // The right-pane tab must be mounted too (it's a second visible editor).
+  useEffect(() => {
+    if (splitId == null) return
+    setMountedIds((prev) => (prev.has(splitId) ? prev : new Set(prev).add(splitId)))
+  }, [splitId])
+
+  // Drop the split when its tab is gone, or it collapsed onto the active tab
+  // (e.g. the user clicked the right-pane's tab in the strip).
+  useEffect(() => {
+    if (splitId != null && (splitId === activeId || !tabs.some((t) => t.id === splitId))) {
+      setSplitId(null)
+    }
+  }, [tabs, splitId, activeId])
+
+  // Once there's no right pane, tab clicks must target the left pane again.
+  useEffect(() => {
+    if (splitId == null && focusedPane !== 'left') setFocusedPane('left')
+  }, [splitId, focusedPane])
+
+  // ----------------------------- theme / i18n -----------------------------
+  useEffect(() => {
+    applyTheme(effectiveTheme)
+  }, [effectiveTheme])
+
+  // ----------------------------- settings ---------------------------------
+  // Apply the editor page width live, and persist any settings change.
+  useEffect(() => {
+    applyPageWidth(settings.pageWidth)
+  }, [settings.pageWidth])
+  useEffect(() => {
+    applyFontSize(settings.fontSize)
+  }, [settings.fontSize])
+  useEffect(() => {
+    applySourceFontOffset(settings.sourceFontOffset)
+  }, [settings.sourceFontOffset])
+  useEffect(() => {
+    applyLineHeight(settings.lineHeight)
+  }, [settings.lineHeight])
+  useEffect(() => {
+    applyParagraphSpacing(settings.paragraphSpacing)
+  }, [settings.paragraphSpacing])
+  useEffect(() => {
+    applyHeadingSpacing(settings.headingSpacing)
+  }, [settings.headingSpacing])
+  useEffect(() => {
+    applyTableAutoWrap(settings.tableAutoWrap)
+  }, [settings.tableAutoWrap])
+  useEffect(() => {
+    applySoftBreakDisplay(settings.preserveSoftBreaks)
+  }, [settings.preserveSoftBreaks])
+  const markdownSyntax = useMemo(() => ({
+    subscript: settings.markdownSubscript === true,
+    superscript: settings.markdownSuperscript === true
+  }), [settings.markdownSubscript, settings.markdownSuperscript])
+  useEffect(() => {
+    applyUserCss(settings.userCssSnippets)
+  }, [settings.userCssSnippets])
+  useEffect(() => {
+    saveSettings(settings)
+  }, [settings])
+  // Local version history: main prunes by the retention the user picked.
+  useEffect(() => {
+    window.api.historyConfigure?.({ retentionDays: settings.historyRetentionDays })?.catch?.(() => {})
+  }, [settings.historyRetentionDays])
+  // Merge a partial settings change (from the Settings modal).
+  const updateSettings = useCallback((partial) => {
+    setSettings((prev) => ({ ...prev, ...partial }))
+  }, [])
+
+  // ----------------------------- custom themes ----------------------------
+  const refreshThemes = useCallback(() => {
+    window.api.themesList?.().then(setCustomThemes).catch(() => {})
+  }, [])
+  useEffect(() => {
+    refreshThemes()
+  }, [refreshThemes])
+  // Imported third-party themes are a manual mode choice. System mode always
+  // applies its explicit built-in light/dark pair; user CSS snippets remain
+  // active in both modes and can use prefers-color-scheme when needed.
+  const effectiveCustomTheme = followsSystemTheme ? null : customTheme
+  useEffect(() => {
+    if (!effectiveCustomTheme) {
+      applyCustomTheme(null)
+      return
+    }
+    let alive = true
+    window.api
+      .themeRead(effectiveCustomTheme)
+      .then((css) => alive && applyCustomTheme(css))
+      .catch(() => {
+        if (!alive) return
+        applyCustomTheme(null)
+        setCustomTheme(null)
+      })
+    return () => {
+      alive = false
+    }
+  }, [effectiveCustomTheme])
+  // Picking a built-in theme clears any custom overlay; picking a custom one
+  // keeps the built-in as the base (chrome + light/dark).
+  const pickBuiltinTheme = useCallback((id) => {
+    setTheme(id)
+    setCustomTheme(null)
+    updateSettings({ themeMode: 'manual' })
+  }, [updateSettings])
+
+  const pickCustomTheme = useCallback((file) => {
+    setCustomTheme(file)
+    updateSettings({ themeMode: 'manual' })
+  }, [updateSettings])
+
+  const cycleTheme = useCallback(() => {
+    setTheme((cur) => {
+      const i = THEMES.findIndex((x) => x.id === cur)
+      return THEMES[(i + 1) % THEMES.length].id
+    })
+    setCustomTheme(null)
+    updateSettings({ themeMode: 'manual' })
+  }, [updateSettings])
+
+  const {
+    pdfExportState,
+    requestPdfExport,
+    cancelPdfExport,
+    savePdfExport
+  } = usePdfExport({ tRef })
+  const {
+    htmlExportState,
+    requestHtmlExport,
+    cancelHtmlExport,
+    saveHtmlExport
+  } = useHtmlExport({ tRef })
+  const {
+    pandocExportState,
+    requestPandocExport,
+    dismissPandocExport
+  } = usePandocExport()
+
+  const getExportSourceForTab = useCallback(async (id) => {
+    const api = editorApis.current[id]
+    if (!api) return null
+    const sourceElement = sourceTextareas.current[id]
+    const source = sourceElement ? getTextareaSourceValue(sourceElement) : null
+    if (sourceElement && api.getMarkdown?.() !== source) {
+      api.replaceMarkdown?.(source)
+    }
+    return await (api.getExportSource?.() || api.getPdfSource?.()) || null
+  }, [editorApis, sourceTextareas])
+
+  // Compatibility name for the existing file/PDF API. New rendered export
+  // formats should use getExportSourceForTab so the shared snapshot is not
+  // mistaken for a PDF-specific DOM clone.
+  const getPdfSourceForTab = getExportSourceForTab
+
+  const waitForPdfSourceForTab = useCallback(async (id) => {
+    const api = await waitForEditorApi(id)
+    if (!api) return null
+    return await getPdfSourceForTab(id)
+  }, [getPdfSourceForTab, waitForEditorApi])
+
+  const getMarkdownForTab = useCallback((id) => {
+    const sourceElement = sourceTextareas.current[id]
+    if (sourceElement) return getTextareaSourceValue(sourceElement)
+    // Save/export is a durability boundary. Unlike a reading-only source-mode
+    // toggle, it must serialize the live ProseMirror doc even when a custom
+    // node view has not yet delivered its edit-intent callback.
+    const editorApi = editorApis.current[id]
+    const flushed = editorApi?.flushMarkdown?.({ force: true })
+    if (typeof flushed === 'string') return flushed
+    // A mounted rich editor returning null means source preservation could not
+    // safely map the visible transaction. Never fall back to stale tab.content
+    // at a durability boundary; callers must abort rather than resurrect data.
+    if (editorApi) return null
+    return tabsRef.current.find((tab) => tab.id === id)?.content || ''
+  }, [editorApis, sourceTextareas, tabsRef])
+
+  const getSettledMarkdownForTab = useCallback(async (id) => {
+    const sourceElement = sourceTextareas.current[id]
+    if (sourceElement) return getTextareaSourceValue(sourceElement)
+    const editorApi = editorApis.current[id]
+    if (!editorApi) return tabsRef.current.find((tab) => tab.id === id)?.content || ''
+    if (typeof editorApi.flushMarkdownSettled === 'function') {
+      return await editorApi.flushMarkdownSettled({ force: true })
+    }
+    return editorApi.flushMarkdown?.({ force: true }) ?? null
+  }, [editorApis, sourceTextareas, tabsRef])
+
+  const getRecoveryMarkdownForTab = useCallback((id) => (
+    editorApis.current[id]?.getRecoveryMarkdown?.() ?? null
+  ), [editorApis])
+  const getSyncReportForTab = useCallback((id, where) => (
+    editorApis.current[id]?.getSyncReport?.(where) ?? null
+  ), [editorApis])
+
+  // Source/rich view state and anchor restoration live in useSourceModeSwitch.
+
+  // File operations (open/new/update/close/save/rename/dup/delete/export) +
+  // workspace + watcher live in hooks/useFileOps.js (phase-2 US-5). Split ops
+  // (openRight/toggleSplit/startSplitDrag/openFileRight) + split state stay
+  // here — they're consumed by the editor-area JSX below.
+  const {
+    openPaths,
+    newTab,
+    openSettingsTab,
+    reorderTabs,
+    updateContent,
+    markRichEditPending,
+    closeTab,
+    closeOthers,
+    renameTabFile,
+    commitTabRename,
+    retargetTabs,
+    duplicateTabFile,
+    deleteTabFile,
+    writeTab,
+    saveTab,
+    commitMobileSave,
+    exportPathToPdf,
+    exportPathToHtml,
+    exportPathWithPandoc,
+    openFolder,
+    folderRoots,
+    addFolder,
+    removeFolder,
+    files,
+    refreshNonce,
+    bumpRefresh,
+    reloadTabFromDisk
+  } = useFileOps({
+    tabs,
+    setTabs,
+    tabsRef,
+    autoSaveActiveRef,
+    setActiveId,
+    setHome,
+    setSplitId,
+    setRecents,
+    commitAllLive,
+    liveContentRef,
+    liveTimersRef,
+    getPdfSourceForTab,
+    getMarkdownForTab,
+    getSettledMarkdownForTab,
+    getRecoveryMarkdownForTab,
+    getSyncReportForTab,
+    waitForPdfSourceForTab,
+    isMobile,
+    t,
+    tRef,
+    setRenameState,
+    setSaveNameState,
+    requestPdfExport,
+    requestHtmlExport,
+    requestPandocExport,
+    setSidebarOpen,
+    initialFolderRoots: initialFolderRoots,
+    editorApis,
+    sourceTextareas,
+    editorHosts
+  })
+
+  const getDirtyPaths = useCallback(() => tabsRef.current.filter((t) => t.path && isTabDirty(t)).map((t) => t.path), [])
+  const syncWorkspaces = useSyncWorkspaces({ folderRoots, addFolder, getDirtyPaths })
+  const autoSync = useAutoSync({ sync: syncWorkspaces, enabled: settings.syncAuto && !offlineMode, minutes: settings.syncAutoMinutes, tRef })
+  // Automatic sync of a cloud-bound folder pairs with auto-save (Obsidian-like):
+  // edits are saved after SYNC_AUTO_SAVE_DELAY s when the user's own is off.
+  const syncAutoSave = !offlineMode && syncWorkspaces.supported && settings.syncAuto && syncWorkspaces.registered.some((entry) => entry.connectionId)
+  const autoSave = useAutoSave({ tabs, delaySec: settings.autoSaveDelay || (syncAutoSave ? SYNC_AUTO_SAVE_DELAY : 0), saveTab, isMobile, tRef })
+  autoSaveActiveRef.current = autoSave.active
+  const openSyncSettings = useCallback(() => {
+    setSettingsViewState((current) => ({ ...current, activeSection: 'sync' }))
+    openSettingsTab()
+  }, [openSettingsTab])
+  const addDroppedFolder = useCallback((path) => {
+    addFolder(path)
+    // A dropped directory is a workspace action. Reveal the file tree even on
+    // a first-run session that currently shows the welcome document outline.
+    setSidebarMode('files')
+  }, [addFolder])
+  const dropOpenActive = useDropOpen({
+    enabled: !isMobile && window.api.capabilities?.nativeDropOpen !== false,
+    openPaths,
+    addFolder: addDroppedFolder
+  })
+  const enableSyncFolder = useCallback(async (rootPath) => {
+    try {
+      const entry = await syncWorkspaces.enableFolder(rootPath)
+      fireToast(tRef.current('sync.enabled', { name: entry.name }))
+    } catch (error) {
+      fireToast(tRef.current('sync.enableFailed', { msg: error?.message || String(error) }), { sticky: true })
+    }
+  }, [syncWorkspaces.enableFolder, tRef])
+  const addSyncFolder = useCallback(async () => {
+    try {
+      const entry = await syncWorkspaces.addSyncFolder()
+      if (entry) fireToast(tRef.current('sync.enabled', { name: entry.name }))
+    } catch (error) {
+      fireToast(tRef.current('sync.enableFailed', { msg: error?.message || String(error) }), { sticky: true })
+    }
+  }, [syncWorkspaces.addSyncFolder, tRef])
+  const removeSyncFolder = useCallback(async (rootPath) => {
+    try {
+      await syncWorkspaces.removeFolder(rootPath)
+      fireToast(tRef.current('sync.stopped'))
+    } catch (error) {
+      fireToast(tRef.current('sync.stopFailed', { msg: error?.message || String(error) }), { sticky: true })
+    }
+  }, [syncWorkspaces.removeFolder, tRef])
+  // 云空间 (SidebarPanes): + adds a sync folder, then Settings › 云同步 to
+  // connect it; stopping asks first (nothing is deleted).
+  const addCloudFolder = useCallback(async () => {
+    try {
+      const entry = await syncWorkspaces.addSyncFolder()
+      if (!entry) return
+      fireToast(tRef.current('sync.enabled', { name: entry.name }))
+      if (!entry.connectionId) openSyncSettings()
+    } catch (error) {
+      fireToast(tRef.current('sync.enableFailed', { msg: error?.message || String(error) }), { sticky: true })
+    }
+  }, [syncWorkspaces.addSyncFolder, tRef, openSyncSettings])
+  const stopCloudFolder = useCallback((rootPath) => {
+    const name = rootPath.split(/[\\/]/).filter(Boolean).pop() || rootPath
+    if (!window.confirm(tRef.current('cloud.stopConfirm', { name }))) return
+    removeSyncFolder(rootPath)
+  }, [removeSyncFolder, tRef])
+  // 云空间's folders are watched for 'cloud' too (main keeps one watcher per
+  // folder until both owners stop): edits / downloads show up there even
+  // when the folder is not in the workspace.
+  const cloudWatchKey = (syncWorkspaces.supported ? syncWorkspaces.registered : []).map((entry) => entry.rootPath).join('\n')
+  useEffect(() => {
+    const roots = cloudWatchKey ? cloudWatchKey.split('\n') : []
+    for (const root of roots) window.api.watchStart?.(root, 'cloud')
+    return () => { for (const root of roots) window.api.watchStop?.(root, 'cloud') }
+  }, [cloudWatchKey])
+
+  // Sync the show-hidden-files setting to main (readTree filter) + refresh the
+  // file tree when it changes (#29).
+  useEffect(() => {
+    window.api.setShowHidden?.(settings.showHiddenFiles)
+    if (folderRoots.length) bumpRefresh()
+  }, [settings.showHiddenFiles, bumpRefresh, folderRoots])
+
+  // Offline mode: main's userData/offline-mode.json is authoritative. Merge it
+  // once at startup, then push only genuine UI changes back to main.
+  useEffect(() => {
+    let alive = true
+    window.api.getOfflineMode?.().then((value) => {
+      if (!alive) return
+      setSettings((prev) => (prev.offlineMode === value ? prev : { ...prev, offlineMode: value === true }))
+      setOfflineStateSynced(true)
+    }).catch(() => setOfflineStateSynced(true))
+    return () => { alive = false }
+  }, [])
+  useEffect(() => window.api.onOfflineChanged?.((value) => {
+    setSettings((prev) => (prev.offlineMode === value ? prev : { ...prev, offlineMode: value === true }))
+  }) ?? undefined, [])
+  useEffect(() => {
+    if (!offlineStateSynced) return
+    window.api.setOfflineMode?.(offlineMode)
+  }, [offlineStateSynced, offlineMode])
+
+  // Keep main's close-to-tray behavior in sync with the persisted preference
+  // (opt-in: both sides default to off, so this only pushes explicit choices).
+  useEffect(() => {
+    window.api.setCloseToTray?.(settings.closeToTray === true)
+  }, [settings.closeToTray])
+
+  // Show a tab in the right (split) pane. If it's currently the active tab, move
+  // the left pane to a different tab so the two panes differ.
+  const openRight = useCallback((id) => {
+    // Settings tabs aren't documents — never place one in the split pane (it
+    // would render an empty right pane, since EditorArea skips kind!=='doc').
+    const target = tabsRef.current.find((t) => t.id === id)
+    if (target?.kind !== 'doc') return
+    setHome(false)
+    setSourceRichSplitId(null)
+    if (id === activeIdRef.current) {
+      const others = tabsRef.current.filter((t) => t.id !== id)
+      if (!others.length) return // only one tab — nothing to split against
+      setActiveId(others[others.length - 1].id)
+    }
+    setSplitId(id)
+  }, [])
+
+  // Toggle split: off → on picks the next DOC tab as the right pane; on → off closes it.
+  const toggleSplit = useCallback(() => {
+    setSourceRichSplitId(null)
+    setSplitId((cur) => {
+      if (cur != null) return null
+      const docs = tabsRef.current.filter((t) => t.kind !== 'settings')
+      if (docs.length < 2) {
+        fireToast(tRef.current('split.needTwo'))
+        return null
+      }
+      const i = docs.findIndex((t) => t.id === activeIdRef.current)
+      const pick = i >= 0 ? docs[(i + 1) % docs.length].id : docs[0].id
+      return pick
+    })
+    setHome(false)
+  }, [])
+
+  const toggleSourceRichSplit = useCallback(async () => {
+    const tab = tabsRef.current.find((item) => item.id === activeIdRef.current)
+    if (isMobile || !tab || tab.kind === 'settings') return
+    if (split) {
+      fireToast(tRef.current('sourceRich.closeDocumentSplit'))
+      return
+    }
+    if (isPlainTextDoc(tab) || (tab.heavy && !richForced.has(tab.id))) {
+      fireToast(tRef.current('sourceRich.unavailable'))
+      return
+    }
+    if (sourceRichSplitId === tab.id) {
+      setSourceRichSplitId(null)
+      return
+    }
+    // Existing source mode owns a sensitive caret/viewport restoration path.
+    // Close it through its public toggle before exposing both panes; the rich
+    // editor stays mounted throughout, so this is not a re-parse.
+    if (sourceMode && !await toggleSource()) return
+    setSourceRichFocusedPane('source')
+    setSourceRichSplitId(tab.id)
+  }, [isMobile, richForced, sourceMode, sourceRichSplitId, split, tRef, toggleSource])
+
+  // The split has an in-panel exit in addition to the existing view-mode
+  // control. Closing it returns directly to the normal rich editor instead of
+  // routing through exclusive source mode.
+  const closeSourceRichSplit = useCallback(() => {
+    setSourceRichSplitId(null)
+    setSourceRichFocusedPane('source')
+  }, [])
+
+  // Drag the divider between the two split panes to change their ratio.
+  const startSplitDrag = useColDrag({
+    bodyClass: 'hm-col-resizing',
+    onStart: () => {
+      const area = editorAreaRef.current
+      return area ? area.getBoundingClientRect() : null
+    },
+    onMove: (ev, rect) => {
+      if (!rect) return
+      setSplitRatio(Math.min(0.8, Math.max(0.2, (ev.clientX - rect.left) / rect.width)))
+    },
+  })
+
+  const startSourceRichSplitDrag = useColDrag({
+    bodyClass: 'hm-col-resizing',
+    onStart: () => {
+      const area = editorAreaRef.current
+      return area ? area.getBoundingClientRect() : null
+    },
+    onMove: (ev, rect) => {
+      if (!rect) return
+      setSourceRichSplitRatio(Math.min(0.72, Math.max(0.28, (ev.clientX - rect.left) / rect.width)))
+    }
+  })
+
+  // Open a file (by path) directly into the right split pane — used by the
+  // sidebar's "Open in Split" so it works even if the file isn't open yet.
+  const openFileRight = useCallback(
+    async (path) => {
+      await openPaths([path])
+      const norm = (path || '').replace(/\\/g, '/')
+      const tab = tabsRef.current.find((t) => (t.path || '').replace(/\\/g, '/') === norm)
+      if (tab) openRight(tab.id)
+    },
+    [openPaths, openRight]
+  )
+
+  // Outline panel (#20) — scrollspy + heading list + click-to-jump. State and
+  // the reflow-free scrollspy live in hooks/useOutline.js (phase-2 US-3).
+  // Returns the names the JSX already uses (Outline props + the Editor's
+  // onStructureChange/onLoadingChange).
+  const outlineId = split && focusedPane === 'right' ? splitId : activeId
+  const outlineTab = tabs.find((tab) => tab.id === outlineId) || null
+  const outlineSourceMode = !!outlineTab && (
+    isPlainTextDoc(outlineTab) ||
+    (outlineTab.heavy && !richForced.has(outlineId)) ||
+    ((sourceMode || (sourceRichSplitMode && sourceRichFocusedPane === 'source')) && outlineId === activeId)
+  )
+  const richLoading = !!outlineId && richLoadingIds.has(outlineId)
+  // Per-document outline fold memory + default expansion level (#122).
+  const outlineFolds = useOutlineFolds(settings.outlineDefaultLevel)
+  // The compact navigator is a separate reading affordance on the opposite
+  // side of the editor. Keep it available when the full sidebar outline is
+  // open as well; hiding it made the right-side navigation appear to vanish.
+  const floatingOutlineEnabled = !isMobile && !home && outlineTab?.kind !== 'settings'
+  const getOutlineEditorHost = useCallback(
+    () => {
+      const host = editorHosts.current[outlineId]
+      if (host?.offsetParent) return host
+      // Mounted background tabs keep their Crepe DOM alive. A stale ref must
+      // never make the outline read a hidden tab instead of the visible pane.
+      return [...document.querySelectorAll('.editor-scroll')].find((node) => node.offsetParent) || null
+    },
+    [outlineId, editorHosts]
+  )
+  const getOutlineSourceTextarea = useCallback(
+    () => sourceTextareas.current[outlineId] || null,
+    [outlineId, sourceTextareas]
+  )
+  const {
+    activeHeading,
+    outlineHeadings,
+    setRichDocVersion,
+    refreshOutline,
+    jumpToHeading
+  } = useOutline({
+    getEditorHost: getOutlineEditorHost,
+    getSourceTextarea: getOutlineSourceTextarea,
+    home,
+    sidebarOpen,
+    sidebarMode,
+    sourceMode: outlineSourceMode,
+    activeId: outlineId,
+    activeTab: outlineTab,
+    richLoading,
+    floating: floatingOutlineEnabled,
+    isMobile,
+    setSidebarOpen,
+    setHome
+  })
+  richLoadingRef.current = !!activeId && richLoadingIds.has(activeId)
+
+  // Issue #82: move a sibling heading together with all of its descendants.
+  // The move operates on raw Markdown ranges, so unsupported node views and
+  // untouched source spelling travel intact instead of being serializer output.
+  const moveOutlineHeading = useCallback((fromIndex, targetIndex, placement) => {
+    if (!outlineId) return false
+    commitLive(outlineId)
+    const tab = tabsRef.current.find((item) => item.id === outlineId)
+    const next = moveHeadingSection(tab?.content, fromIndex, targetIndex, placement)
+    if (!next || !tab) return false
+
+    if (outlineSourceMode) {
+      const textarea = sourceTextareas.current[outlineId]
+      if (!textarea) return false
+      setTextareaSourceValue(textarea, next)
+      sourceEditedIds.current.add(outlineId)
+    } else if (!editorApis.current[outlineId]?.replaceMarkdown?.(next)) {
+      return false
+    }
+
+    const apply = (items) => items.map((item) => item.id === outlineId ? { ...item, content: next } : item)
+    tabsRef.current = apply(tabsRef.current)
+    setTabs((items) => apply(items))
+    refreshOutline()
+    return true
+  }, [outlineId, outlineSourceMode, commitLive, editorApis, refreshOutline, setTabs, sourceEditedIds, sourceTextareas, tabsRef])
+
+  // ------------------------- menu / shortcuts ----------------------
+  // Find & replace (issue #19) — hoisted above the handlers so createMenuHandlers
+  // (US-6) can close over setFind/findInputRef/replaceInputRef. Returns the same
+  // names the findbar JSX uses.
+  const findSourceActive = sourceMode ||
+    (sourceRichSplitMode && sourceRichFocusedPane === 'source') ||
+    isPlainTextDoc(activeTab) || (activeTab?.heavy && !richForced.has(activeTab.id))
+  const { find, setFind, findInputRef, replaceInputRef, replaceRef, runFind, stepFind, closeFind, applyReplace, openFind, setFindOption, findNavAtRef } =
+    useFindReplace({
+      editorHostRef,
+      sourceRef,
+      editorApis,
+      activeId,
+      viewModeKey: `${sourceMode ? 'source' : 'rich'}:${sourceRichSplitMode ? sourceRichFocusedPane : 'single'}`,
+      sourceFindActive: findSourceActive,
+      commitLive,
+      liveContentRef,
+      findSwitchOwnerRef
+    })
+  findStateRef.current = { open: find.open, query: find.query, matches: find.matches, navAtRef: findNavAtRef }
+
+  // Workspace-wide search (issue #120) — the third sidebar mode. Jump lands
+  // the in-document FindBar on the clicked match (see useGlobalSearch).
+  const { query: searchQuery, setQuery: setSearchQuery, results: searchResults, jumpToMatch } = useGlobalSearch({
+    roots: folderRoots,
+    openPaths,
+    tabsRef,
+    editorApis,
+    editorHostRef,
+    waitForEditorApi,
+    setFind,
+    runFind,
+    findInputRef
+  })
+
+  // In split view, target the pane you're actually editing (last focused), as
+  // long as it's one of the two visible panes; otherwise the active (left) tab.
+  const pickEditableId = () => {
+    const f = focusedTabRef.current
+    if (f && (f === activeId || f === splitId)) return f
+    return activeId
+  }
+
+  // Rename command (F2, #156): the focused file-tree row (file or folder),
+  // else the current document — inline in the tree when its row is showing,
+  // otherwise the rename dialog.
+  const sidebarApiRef = useRef(null)
+  const renameFileCommand = () => {
+    const row = document.activeElement?.closest?.('.tree-row[data-path]')
+    if (row && sidebarApiRef.current?.startRename(row.dataset.path)) return
+    if (home) return
+    const id = pickEditableId()
+    const tab = tabsRef.current.find((x) => x.id === id)
+    if (!tab?.path || tab.kind === 'settings') return
+    if (sidebarOpen && sidebarMode === 'files' && sidebarApiRef.current?.startRename(tab.path)) return
+    renameTabFile(id)
+  }
+
+  // 历史版本… of the current document (untitled tabs have none yet).
+  const fileHistoryCommand = () => {
+    if (!historySupported()) return
+    const tab = home ? null : tabsRef.current.find((x) => x.id === pickEditableId())
+    if (!tab || tab.kind === 'settings') return
+    if (!tab.path) {
+      fireToast(t('history.needsSave'))
+      return
+    }
+    openFileHistory(tab.path)
+  }
+  const deletedFilesCommand = () => {
+    if (historySupported()) openDeletedFiles()
+  }
+
+  const { attachFiles } = useAttachments({
+    pickEditableId,
+    tabsRef,
+    setTabs,
+    sourceTextareas,
+    sourceEditedIds,
+    liveContentRef,
+    commitLive,
+    commitAllLive,
+    editorApis,
+    tRef
+  })
+
+  // Review actions (CriticMarkup) on the active/focused tab. pickEditableId is
+  // shared with the save/export handlers, so it stays here; the rest lives in
+  // lib/reviewActions.js (phase-2 US-1).
+  const review = createReviewActions({
+    pickEditableId,
+    tabsRef,
+    sourceTextareas,
+    editorApis,
+    setHome,
+    updateContent,
+    setTabs,
+    tRef
+  })
+
+  // Command dispatch map (menu IPC + keyboard + palette) — built by
+  // createMenuHandlers in lib/menuHandlers.js (phase-2 US-6). Stored in a ref so
+  // the menu/keyboard listeners (useGlobalKeys) always read the latest actions.
+  const handlers = useRef({})
+  const {
+    keybindingState,
+    effectiveKeybindings,
+    setKeybindings,
+    resetCommand: resetCommandKeybindings,
+    resetAll: resetAllKeybindings
+  } = useKeybindings()
+  // Reading mode (#163): read-only documents; the hint only while one shows.
+  const { toggleReadingMode, notifyBlocked: notifyReadOnlyBlocked } = useReadingMode({
+    readingMode,
+    enabled: !home && Boolean(activeTab) && activeTab?.kind !== 'settings',
+    effectiveKeybindings,
+    platform: window.api.platform,
+    updateSettings,
+    t
+  })
+  const readOnlyRef = useRef(readOnly)
+  readOnlyRef.current = readOnly
+
+  // Full-screen reading/editing: only while a document is showing.
+  const { immersive, reveal: immersiveReveal, hint: immersiveHint, toggleImmersive, exitImmersive } = useImmersiveMode({
+    enabled: !home && Boolean(activeTab) && activeTab?.kind !== 'settings',
+    effectiveKeybindings,
+    platform: window.api.platform,
+    // Touch screens have no hover edge.
+    revealEdges: !isMobile
+  })
+  useEffect(() => {
+    window.api.setMenuKeybindings?.(buildElectronAcceleratorPayload(effectiveKeybindings))
+  }, [effectiveKeybindings])
+  // OS-level commands (show/hide window) are registered by the main process with
+  // globalShortcut, so the resolved binding has to be pushed there too. The reply
+  // names any combination the OS/another app already owns — the keyboard settings
+  // page surfaces that instead of failing silently.
+  const [globalShortcutStatus, setGlobalShortcutStatus] = useState(null)
+  useEffect(() => {
+    window.api
+      .setGlobalShortcuts?.(buildGlobalAcceleratorPayload(effectiveKeybindings))
+      .then((res) => {
+        if (res?.ok) setGlobalShortcutStatus({ accelerators: res.accelerators, unregistered: res.unregistered })
+      })
+      .catch(() => {})
+  }, [effectiveKeybindings])
+  handlers.current = createMenuHandlers({
+    pickEditableId,
+    activeId,
+    setHome,
+    isMobile,
+    setSidebarOpen,
+    setSidebarMode,
+    setPaletteOpen,
+    toggleImmersive,
+    toggleReadingMode: isMobile ? undefined : toggleReadingMode,
+    isReadOnly: () => readOnlyRef.current,
+    onReadOnlyBlocked: () => {
+      if (isMobile) fireToast(t('mobile.readOnlyBlocked'))
+      else notifyReadOnlyBlocked()
+    },
+    outlineFolds,
+    outlineDocId: outlineId,
+    headingFold: (action) => {
+      // The editor being worked in: the focused one (split view), else the
+      // active pane's visible editor.
+      const focused = document.activeElement?.closest?.('.ProseMirror')
+      const dom = focused || [...(editorHostRef.current?.querySelectorAll('.ProseMirror') || [])]
+        .find((el) => el.offsetParent)
+      dom?.dispatchEvent(new CustomEvent('hm-heading-fold', { detail: { action } }))
+    },
+    renameFile: renameFileCommand,
+    fileHistory: fileHistoryCommand,
+    deletedFiles: deletedFilesCommand,
+    newTab,
+    openPaths,
+    openFolder,
+    saveTab,
+    attachFiles,
+    closeTab,
+    toggleSource: toggleSourceView,
+    cycleTheme,
+    getPdfSourceForTab,
+    getExportSourceForTab,
+    getMarkdownForTab,
+    tabs,
+    tRef,
+    setFind,
+    findInputRef,
+    replaceInputRef,
+    openFind,
+    review,
+    requestPdfExport,
+    requestHtmlExport,
+    requestPandocExport
+  })
+
+  // App lifecycle (session restore/persist/flush + update check + toast +
+  // first-run onboarding) lives in hooks/useAppLifecycle.js (phase-2 US-4).
+  // flushSession is also used by the window-close guard; update/toast/
+  // dismissUpdate/setToast feed the JSX. These are read only inside effect/event
+  // closures, so defining them here is safe (resolved at commit/call time).
+  const { update, dismissUpdate, hideUpdate, showUpdate, toast, setToast, flushSession } = useAppLifecycle({
+    session,
+    tabs,
+    activePath,
+    folderRoots,
+    theme,
+    customTheme,
+    lang,
+    recents,
+    sidebarOpen,
+    sidebarMode,
+    paneWidth,
+    restoreSession: settings.restoreSession,
+    offline: offlineMode,
+    openPaths,
+    isMobile,
+    tabsRef,
+    setActiveId,
+    setTabs,
+    setSidebarMode,
+    setSidebarOpen,
+    setHome,
+    tRef
+  })
+  // In-app update download (#164). Closing the prompt while a download runs
+  // only hides it (the version is not dismissed); it comes back when the
+  // download is done. Settings › About starts it with 'hm:update-download'.
+  const updateDl = useUpdateDownload()
+  // Turning offline on aborts work already in flight. Main also stops sync and
+  // cancels the update when it receives offline:set; this renderer-side call
+  // keeps the visible download state in sync immediately.
+  const wasOfflineRef = useRef(offlineMode)
+  useEffect(() => {
+    if (offlineMode && !wasOfflineRef.current) {
+      updateDl.cancel()
+      for (const entry of syncWorkspaces.registered || []) {
+        syncWorkspaces.controlSync?.(entry.rootPath, 'stop')
+      }
+    }
+    wasOfflineRef.current = offlineMode
+  }, [offlineMode, updateDl, syncWorkspaces.registered, syncWorkspaces.controlSync])
+  const lastUpdateRef = useRef(null)
+  if (update) lastUpdateRef.current = update
+  const closeUpdate = useCallback(() => {
+    if (updateDl.state.status === 'downloading' || updateDl.state.status === 'ready') hideUpdate()
+    else dismissUpdate()
+  }, [updateDl.state.status, hideUpdate, dismissUpdate])
+  useEffect(() => {
+    if (updateDl.state.status === 'ready' && !update && lastUpdateRef.current) showUpdate(lastUpdateRef.current)
+  }, [updateDl.state.status]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const onStart = (event) => {
+      if (event.detail?.latest) showUpdate(event.detail)
+      updateDl.start()
+    }
+    window.addEventListener('hm:update-download', onStart)
+    return () => window.removeEventListener('hm:update-download', onStart)
+  }, [showUpdate, updateDl.start]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A rich input can be visibly committed while Milkdown's 200ms Markdown
+  // listener is still pending. Before writing an unsaved scratch session during
+  // app close, settle only those pending editors so the final character is not
+  // omitted from the restored draft.
+  const flushPendingRichEdits = useCallback(() => {
+    const updates = new Map()
+    for (const tab of tabsRef.current) {
+      if (!tab.pendingRichEdit || sourceTextareas.current[tab.id]) continue
+      const markdown = editorApis.current[tab.id]?.flushMarkdown?.({ force: true })
+      if (typeof markdown === 'string') updates.set(tab.id, markdown)
+    }
+    if (!updates.size) return
+    const apply = (items) => items.map((tab) => {
+      if (!updates.has(tab.id)) return tab
+      return { ...tab, content: updates.get(tab.id), pendingRichEdit: false }
+    })
+    tabsRef.current = apply(tabsRef.current)
+    setTabs(apply)
+  }, [editorApis, setTabs, sourceTextareas, tabsRef])
+
+  // Global menu IPC + keyboard shortcuts (US-6) — flushSession comes from
+  // useAppLifecycle just above, so this call sits after it.
+  useGlobalKeys({
+    handlers,
+    openPaths,
+    openFolder,
+    isAbsolutePath,
+    addFolderByPath: addFolder,
+    setSidebarMode,
+    setSidebarOpen,
+    commitAllLive,
+    flushPendingRichEdits,
+    flushSession,
+    tabsRef,
+    tRef,
+    setTabs,
+    activeId,
+    activeTabKind: !home ? activeTab?.kind || null : null,
+    setActiveId,
+    setHome,
+    effectiveKeybindings
+  })
+  // --------------------------- commands ----------------------------
+  const commands = useCommands({ t, handlers, effectiveKeybindings })
+
+  const platformClass =
+    ({ win32: ' is-win', linux: ' is-linux', darwin: ' is-mac', ios: ' is-ios is-mobile', android: ' is-android is-mobile' }[
+      window.api.platform
+    ] || '')
+  // Save targets the focused pane (pickEditableId), so the FAB must reflect
+  // THAT pane's dirty state — not always the left/active tab. In split view this
+  // is what makes the FAB follow whichever pane the user is editing.
+  const fabId = pickEditableId()
+  const fabTab = (fabId ? tabs.find((t) => t.id === fabId) : null) || activeTab
+
+  // Drag the left-pane's right edge to resize it (outline / file-tree, #resizable-pane).
+  // Reads the live width from the DOM at mousedown (via useColDrag's onStart) so a
+  // stale closure can't fight the drag; clamps to PANE_MIN..PANE_MAX. The body class
+  // disables the width transition (so it tracks the cursor) + text selection.
+  const startResize = useColDrag({
+    bodyClass: 'resizing-pane',
+    onStart: (e) => {
+      const aside = e.currentTarget.previousElementSibling
+      return { x: e.clientX, w: aside ? aside.getBoundingClientRect().width : PANE_DEFAULT }
+    },
+    onMove: (ev, { x, w }) => setPaneWidth(Math.max(PANE_MIN, Math.min(PANE_MAX, w + (ev.clientX - x)))),
+  })
+
+  // User font overrides (issue #38). Applied as inline CSS vars on the .app root
+  // so they win over body.light/dark AND — for the code font — the .app.is-win
+  // Consolas rule. Empty font = no inline var, so the default stacks (and the
+  // Windows Consolas fix) still apply. Cascades to the editor + the settings
+  // preview, giving live feedback as the user types a name.
+  // Hover-preview (#38): while the cursor is over a font option in the picker,
+  // temporarily apply it so the preview + editor react live — no click needed.
+  // Cleared on leave/close; pick writes to settings (the persistent value).
+  const [hoverFont, setHoverFont] = useState({})
+  const fwStack = writeFontStack(
+    hoverFont.latin ?? settings.fontWriteLatin,
+    hoverFont.write ?? settings.fontWrite
+  )
+  const fmStack = fontStack(hoverFont.mono ?? settings.fontMono, DEFAULT_FONT_MONO)
+  const appFontStyle = {
+    ...(fwStack ? { '--font-write': fwStack } : {}),
+    ...(fmStack ? { '--font-mono': fmStack } : {})
+  }
+
+  return (
+    <I18nProvider lang={lang} setLang={setLang}>
+    <div className={`app${platformClass}${isMobile && sidebarOpen ? ' drawer-open' : ''}${settings.selectionToolbar === false ? ' hm-selection-toolbar-disabled' : ''}${immersive ? ' hm-immersive' : ''}${immersive && !isMobile ? ' hm-immersive-edges' : ''}${immersiveReveal ? ' hm-reveal' : ''}`} style={appFontStyle}>
+      {dropOpenActive && <DropOpenOverlay t={t} />}
+      <ActivityBar
+        home={home}
+        sidebarMode={sidebarMode}
+        sidebarOpen={sidebarOpen}
+        settingsActive={!home && activeTab?.kind === 'settings'}
+        t={t}
+        onHome={() => handlers.current.home()}
+        onFiles={() => handlers.current.toggleFiles()}
+        onOutline={() => handlers.current.toggleOutline()}
+        onSearch={() => handlers.current.globalSearch()}
+        onSettings={openSettingsTab}
+        onToggleSidebar={() => setSidebarOpen((v) => !v)}
+      />
+
+      <Topbar
+        isMobile={isMobile}
+        readOnly={mobileReadOnly}
+        t={t}
+        tabs={tabs}
+        activeId={home ? null : activeId}
+        splitId={home ? null : splitId}
+        focusedPane={focusedPane}
+        split={split}
+        imageUploadCommand={offlineMode ? '' : settings.imageUploadCommand}
+        imageHostDisabled={offlineMode}
+        effectiveKeybindings={effectiveKeybindings}
+        onActivate={(id) => {
+          setHome(false)
+          // Load into whichever pane is focused, so both panes are switchable.
+          if (split && focusedPane === 'right' && id !== activeId) setSplitId(id)
+          else setActiveId(id)
+        }}
+        onClose={closeTab}
+        onNew={newTab}
+        onCloseOthers={closeOthers}
+        onOpenRight={openRight}
+        onRename={renameTabFile}
+        onDuplicate={duplicateTabFile}
+        onDelete={deleteTabFile}
+        onExportPdf={exportPathToPdf}
+        onExportHtml={exportPathToHtml}
+        onExportPandoc={exportPathWithPandoc}
+        onShowHistory={historySupported() ? openFileHistory : undefined}
+        onReorder={reorderTabs}
+        onToggleSidebar={() => setSidebarOpen((v) => !v)}
+        onToggleReadOnly={() => updateSettings({ mobileReadOnly: !settings.mobileReadOnly })}
+        onToggleSplit={toggleSplit}
+        onImageHostChange={(cmd) => updateSettings({ imageUploadCommand: cmd })}
+        onOpenPalette={() => setPaletteOpen(true)}
+        onToggleImmersive={home || activeTab?.kind === 'settings' ? undefined : toggleImmersive}
+      />
+
+      {isMobile && sidebarOpen && (
+        <div className="hm-scrim" onClick={() => setSidebarOpen(false)} />
+      )}
+
+      <div className="body">
+        <aside
+          className={`pane-left${sidebarOpen ? '' : ' collapsed'}`}
+          style={{ '--pane-left-w': paneWidth + 'px' }}
+        >
+          {sidebarOpen && (
+            sidebarMode === 'files' ? (
+              <SidebarPanes
+                cloudEnabled={syncWorkspaces.supported && !offlineMode}
+                cloudEntries={syncWorkspaces.registered}
+                syncStatus={syncSummary({ sync: syncWorkspaces, autoSync, syncAuto: settings.syncAuto, t })}
+                onAddCloudFolder={addCloudFolder}
+                onAddToWorkspace={addFolder}
+                onOpenSyncSettings={openSyncSettings}
+                onStopSync={stopCloudFolder}
+                folderRoots={folderRoots}
+                onAddFolder={openFolder}
+                onRemoveFolder={removeFolder}
+                activePath={activePath}
+                onOpenFile={(p) => { openPaths([p]); if (isMobile) setSidebarOpen(false) }}
+                onOpenRight={openFileRight}
+                onExportPdf={exportPathToPdf}
+                onExportHtml={exportPathToHtml}
+                onExportPandoc={exportPathWithPandoc}
+                onShowHistory={historySupported() ? openFileHistory : undefined}
+                refreshNonce={refreshNonce}
+                syncSupported={syncWorkspaces.supported}
+                syncFolderPaths={syncWorkspaces.registered.map((entry) => entry.rootPath)}
+                onEnableSyncFolder={enableSyncFolder}
+                onPathMoved={retargetTabs}
+                apiRef={sidebarApiRef}
+              />
+            ) : sidebarMode === 'search' ? (
+              <GlobalSearchPanel
+                query={searchQuery}
+                onQuery={setSearchQuery}
+                results={searchResults}
+                t={t}
+                onJump={jumpToMatch}
+                onAddFolder={openFolder}
+                hasRoots={folderRoots.length > 0}
+              />
+            ) : (
+              <Outline
+                headings={outlineHeadings}
+                activeIndex={activeHeading}
+                loading={richLoading}
+                onJump={jumpToHeading}
+                onMoveHeading={isMobile || readOnly ? undefined : moveOutlineHeading}
+                docKey={outlineId}
+                defaultLevel={settings.outlineDefaultLevel}
+                folds={outlineFolds}
+              />
+            )
+          )}
+        </aside>
+        {sidebarOpen && !isMobile && (
+          <div
+            className="pane-left-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            onMouseDown={startResize}
+            onDoubleClick={() => setPaneWidth(PANE_DEFAULT)}
+            title={t('side.resize')}
+          />
+        )}
+
+        <main className="pane-center">
+          {find.open && (
+            <FindBar
+              find={find}
+              findInputRef={findInputRef}
+              replaceInputRef={replaceInputRef}
+              t={t}
+              onQuery={(q) => { setFind((f) => ({ ...f, query: q })); runFind(q) }}
+              onReplaceText={(text) => { replaceRef.current = text; setFind((f) => ({ ...f, replace: text })) }}
+              onToggleOption={setFindOption}
+              onPrev={stepFind}
+              onNext={stepFind}
+              onClose={closeFind}
+              readOnly={readOnly}
+              onReplace={readOnly ? undefined : applyReplace}
+              onReplaceAll={readOnly ? undefined : applyReplace}
+            />
+          )}
+
+          {/* Editor area — extracted to components/shell/EditorArea.jsx (US-7).
+              Preserves lazy mount + uncontrolled textarea + split flex/order. */}
+          <EditorArea
+            tabs={tabs}
+            activeId={activeId}
+            splitId={splitId}
+            split={split}
+            splitRatio={splitRatio}
+            focusedPane={focusedPane}
+            home={home}
+            sourceMode={sourceMode}
+            sourceRichSplitMode={sourceRichSplitMode}
+            sourceRichSplitRatio={sourceRichSplitRatio}
+            richPreviewState={richPreviewState}
+            richForced={richForced}
+            mountedIds={mountedIds}
+            activeTab={activeTab}
+            imageUploadCommand={offlineMode ? '' : settings.imageUploadCommand}
+            spellcheck={settings.spellcheck}
+            inlineMathDeleteMode={settings.inlineMathDeleteMode}
+            markdownSyntax={markdownSyntax}
+            selectionToolbar={settings.selectionToolbar}
+            readOnly={readOnly}
+            effectiveKeybindings={effectiveKeybindings}
+            editorAreaRef={editorAreaRef}
+            editorHostRef={editorHostRef}
+            editorHosts={editorHosts}
+            sourceRef={sourceRef}
+            sourceTextareas={sourceTextareas}
+            sourceEditedIds={sourceEditedIds}
+            liveContentRef={liveContentRef}
+            liveTimersRef={liveTimersRef}
+            commitLive={commitLive}
+            editorApis={editorApis}
+            registerEditorApi={registerEditorApi}
+            activeIdRef={activeIdRef}
+            focusedTabRef={focusedTabRef}
+            setRichForced={setRichForced}
+            setSplitId={setSplitId}
+            setFocusedPane={setFocusedPane}
+            setActiveBlock={setActiveBlock}
+            setRichDocVersion={setRichDocVersion}
+            setTabRichLoading={setTabRichLoading}
+            startSplitDrag={startSplitDrag}
+            startSourceRichSplitDrag={startSourceRichSplitDrag}
+            onSourceInput={onSourceInput}
+            onSourceCompositionStart={onSourceCompositionStart}
+            onSourceCompositionEnd={onSourceCompositionEnd}
+            onSourcePaneFocus={() => setSourceRichFocusedPane('source')}
+            onRichPaneFocus={() => setSourceRichFocusedPane('rich')}
+            onCloseSourceRichSplit={closeSourceRichSplit}
+            onToggleSourceRichSplit={toggleSourceRichSplit}
+            updateContent={updateContent}
+            markRichEditPending={markRichEditPending}
+            t={t}
+          />
+
+          {floatingOutlineEnabled && outlineHeadings.length > 0 && !richLoading && (
+            <FloatingOutline
+              headings={outlineHeadings}
+              activeIndex={activeHeading}
+              onJump={jumpToHeading}
+              style={split && focusedPane === 'left'
+                ? { right: `calc(${Math.round((1 - splitRatio) * 10000) / 100}% + 12px)` }
+                : undefined}
+            />
+          )}
+
+          {/* Settings page — a full-tab view for kind:'settings' tabs (the
+              ActivityBar gear button opens one). EditorArea skips settings
+              tabs, so this sibling renders in their place. */}
+          {!home && activeTab?.kind === 'settings' && (
+            <SettingsView
+              settings={settings}
+              onUpdateSettings={updateSettings}
+              onHoverFont={setHoverFont}
+              activeSection={settingsViewState.activeSection}
+              onActiveSectionChange={(activeSection) => setSettingsViewState((current) => ({
+                ...current,
+                activeSection
+              }))}
+              activeCssSnippetId={settingsViewState.activeCssSnippetId}
+              onActiveCssSnippetIdChange={(activeCssSnippetId) => setSettingsViewState((current) => ({
+                ...current,
+                activeCssSnippetId
+              }))}
+              theme={effectiveTheme}
+              setTheme={pickBuiltinTheme}
+              customThemes={customThemes}
+              customTheme={effectiveCustomTheme}
+              onPickCustom={pickCustomTheme}
+              onOpenThemesFolder={() => window.api.themesReveal?.()}
+              onGetMoreThemes={() => window.api.openExternal('https://theme.typora.io/')}
+              followsSystemTheme={followsSystemTheme}
+              lang={lang}
+              setLang={setLang}
+              effectiveKeybindings={effectiveKeybindings}
+              keybindingState={keybindingState}
+              onSetKeybindings={setKeybindings}
+              onResetCommandKeybindings={resetCommandKeybindings}
+              onResetAllKeybindings={resetAllKeybindings}
+              globalShortcutStatus={globalShortcutStatus}
+              cloudSync={syncWorkspaces.supported}
+              syncAutoSave={syncAutoSave}
+              offlineReady={offlineStateSynced}
+              syncWorkspaces={syncWorkspaces}
+              autoSync={autoSync}
+              folderRoots={folderRoots}
+              onEnableSyncFolder={enableSyncFolder}
+              onAddSyncFolder={addSyncFolder}
+              onRemoveSyncFolder={removeSyncFolder}
+            />
+          )}
+
+          {(home || !activeTab) && (
+            <Welcome
+              t={t}
+              lang={lang}
+              recents={recents}
+              onNew={newTab}
+              onOpen={() => handlers.current.open()}
+              onOpenFolder={openFolder}
+              onOpenRecent={(p) => openPaths([p])}
+              onRemoveRecent={(p) =>
+                setRecents((prev) => prev.filter((r) => r.path !== p))
+              }
+              effectiveKeybindings={effectiveKeybindings}
+            />
+          )}
+        </main>
+      </div>
+
+      <StatusBar
+        tab={home || activeTab?.kind === 'settings' ? null : activeTab}
+        isMobile={isMobile}
+        onSave={() => handlers.current.save()}
+        onShare={() => {
+          if (!activeTab) return
+          if (!activeTab.path) {
+            fireToast(tRef.current('save.shareNeedsSave'), { sticky: true })
+            return
+          }
+          window.api.shareFile?.(activeTab.path)
+        }}
+        onSettings={openSettingsTab}
+        sync={syncWorkspaces}
+        autoSync={autoSync}
+        syncAuto={settings.syncAuto}
+        offline={offlineMode}
+        onOpenSync={openSyncSettings}
+        theme={effectiveTheme}
+        setTheme={pickBuiltinTheme}
+        cycleTheme={cycleTheme}
+        customThemes={customThemes}
+        customTheme={effectiveCustomTheme}
+        onPickCustom={pickCustomTheme}
+        onRefreshThemes={refreshThemes}
+        onOpenThemesFolder={() => window.api.themesReveal?.()}
+        onGetMoreThemes={() => window.api.openExternal('https://theme.typora.io/')}
+        lang={lang}
+        setLang={setLang}
+        effectiveKeybindings={effectiveKeybindings}
+        sourceMode={sourceMode}
+        onToggleSource={toggleSourceView}
+        activeBlock={activeBlock}
+        onPickBlock={readOnly ? undefined : (id) => editorApis.current[activeId]?.setBlock(id)}
+        readingMode={readingMode}
+        onToggleReadingMode={home || activeTab?.kind === 'settings' ? undefined : toggleReadingMode}
+        pageWidth={settings.pageWidth}
+        onSetPageWidth={(w) => updateSettings({ pageWidth: w })}
+        fontSize={settings.fontSize}
+        onSetFontSize={(s) => updateSettings({ fontSize: s })}
+        lineHeight={settings.lineHeight}
+        onSetLineHeight={(v) => updateSettings({ lineHeight: v })}
+        paragraphSpacing={settings.paragraphSpacing}
+        onSetParagraphSpacing={(v) => updateSettings({ paragraphSpacing: v })}
+        headingSpacing={settings.headingSpacing}
+        onSetHeadingSpacing={(v) => updateSettings({ headingSpacing: v })}
+      />
+
+      {immersiveHint && !immersiveReveal && (
+        <div className="hm-immersive-hint">
+          <span className="hm-immersive-edge top" aria-hidden="true" />
+          <span className="hm-immersive-edge bottom" aria-hidden="true" />
+          <span className="hm-immersive-edge left" aria-hidden="true" />
+          <div className="hm-immersive-hint-pill" role="status">
+            <span>{t('immersive.hint')}</span>
+            <span className="hm-immersive-hint-sep" />
+            <span className="hm-immersive-hint-esc"><kbd>Esc</kbd>{t('immersive.hintEsc')}</span>
+          </div>
+        </div>
+      )}
+
+      {immersive && (
+        <div className="hm-immersive-corner">
+          {isTabDirty(fabTab) && (
+            <span className="hm-immersive-dirty" title={t('immersive.unsaved')} aria-label={t('immersive.unsaved')} />
+          )}
+          <button
+            type="button"
+            className="hm-immersive-exit"
+            title={t('immersive.exit')}
+            aria-label={t('immersive.exit')}
+            onClick={exitImmersive}
+          >
+            <Icon name="shrink" size={16} />
+          </button>
+        </div>
+      )}
+
+      <SaveFab
+        visible={!immersive && !home && activeTab?.kind !== 'settings' && isTabDirty(fabTab) && !autoSave.isAutoSaved(fabTab)}
+        effectiveKeybindings={effectiveKeybindings}
+        onSave={() => handlers.current.save()}
+      />
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        commands={commands}
+        files={files}
+        onOpenFile={(p) => { openPaths([p]); if (isMobile) setSidebarOpen(false) }}
+      />
+
+      {toast?.action ? (
+        // An error toast with an action (查看详情): a light card like the
+        // update prompt — icon, title, message, the ask, 关闭 / action.
+        <div className="hm-toast sticky has-action" role="alertdialog" key={toast.key}>
+          <div className="hm-alert-head">
+            <span className="hm-alert-icon"><Icon name="alert" size={18} /></span>
+            <div className="hm-alert-text">
+              <div className="hm-alert-title">{t('syncReport.toastTitle')}</div>
+              <div className="hm-toast-msg">{toast.msg}</div>
+              {toast.action.hint && <div className="hm-toast-hint">{toast.action.hint}</div>}
+            </div>
+          </div>
+          <div className="hm-alert-foot">
+            <button className="hm-alert-secondary" onClick={() => setToast(null)}>{t('syncReport.close')}</button>
+            <button className="hm-toast-action" onClick={() => toast.action.run()}>{toast.action.label}</button>
+          </div>
+        </div>
+      ) : toast && (
+        <div className={`hm-toast${toast.sticky ? ' sticky' : ''}`} role="status" key={toast.key}>
+          <span className="hm-toast-msg">{toast.msg}</span>
+          {toast.sticky && (
+            <button className="hm-toast-close" onClick={() => setToast(null)} aria-label="Close">
+              <Icon name="close" size={15} />
+            </button>
+          )}
+        </div>
+      )}
+
+      <SyncReportDialog t={t} />
+
+      {historySupported() && (
+        <>
+          <HistoryDialog
+            getOpenTab={(path) => {
+              const tab = tabsRef.current.find((x) => x.path === path && x.kind !== 'settings')
+              if (!tab) return null
+              // read(): the live text (unsaved edits included), only when the diff needs it.
+              return { dirty: isTabDirty(tab), read: () => getMarkdownForTab(tab.id) ?? tab.content }
+            }}
+          />
+          <DeletedFilesDialog folderRoots={folderRoots} retentionDays={settings.historyRetentionDays} />
+        </>
+      )}
+
+      {renameState && (
+        <RenameModal
+          t={t}
+          initial={renameState.value}
+          onConfirm={(name) => commitTabRename(renameState.id, name)}
+          onCancel={() => setRenameState(null)}
+        />
+      )}
+
+      {saveNameState && (
+        <RenameModal
+          t={t}
+          title={t('save.nameTitle')}
+          initial={saveNameState.value}
+          onConfirm={(name) => commitMobileSave(saveNameState.id, name)}
+          onCancel={() => setSaveNameState(null)}
+        />
+      )}
+
+      {pdfExportState && PdfExportStudio && (
+        <Suspense fallback={<div role="status" style={{ position: 'fixed', inset: 0, zIndex: 1500, display: 'grid', placeItems: 'center', color: 'var(--text)', background: 'var(--bg-elevated)' }}>{t('pdf.previewWaiting')}</div>}>
+          <PdfExportStudio
+            t={t}
+            request={pdfExportState}
+            saving={pdfExportState.status === 'saving'}
+            saveError={pdfExportState.error}
+            onCancel={cancelPdfExport}
+            onSave={savePdfExport}
+          />
+        </Suspense>
+      )}
+
+      {htmlExportState && HtmlExportStudio && (
+        <Suspense fallback={<div role="status" style={{ position: 'fixed', inset: 0, zIndex: 1500, display: 'grid', placeItems: 'center', color: 'var(--text)', background: 'var(--bg-elevated)' }}>{t('html.previewWaiting')}</div>}>
+          <HtmlExportStudio
+            t={t}
+            request={htmlExportState}
+            saving={htmlExportState.status === 'saving'}
+            saveError={htmlExportState.error}
+            onCancel={cancelHtmlExport}
+            onSave={saveHtmlExport}
+          />
+        </Suspense>
+      )}
+
+      {pandocExportState && PandocExportStatus && (
+        <Suspense fallback={null}>
+          <PandocExportStatus
+            state={pandocExportState}
+            onDismiss={dismissPandocExport}
+            onInstall={() => window.api.openExternal('https://pandoc.org/installing.html')}
+            t={t}
+          />
+        </Suspense>
+      )}
+
+      {update && (
+        <UpdateToast
+          t={t}
+          latest={update.latest}
+          current={update.current}
+          notes={update.notes}
+          download={update.download}
+          dl={updateDl.state}
+          onDirect={updateDl.start}
+          onGitHub={() => {
+            window.api.openExternal(update.url)
+            if (updateDl.state.status !== 'downloading') dismissUpdate()
+          }}
+          onCancel={updateDl.cancel}
+          onInstall={updateDl.install}
+          onShowFile={updateDl.showFile}
+          onHide={hideUpdate}
+          onDismiss={closeUpdate}
+        />
+      )}
+    </div>
+    </I18nProvider>
+  )
+}

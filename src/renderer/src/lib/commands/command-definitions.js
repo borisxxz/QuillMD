@@ -1,0 +1,566 @@
+export const COMMAND_CONTEXTS = {
+  APP: 'app',
+  DOCUMENT: 'document',
+  EDITOR: 'editor',
+  REVIEW: 'review'
+}
+
+export const COMMAND_CATEGORIES = {
+  FILE: 'file',
+  VIEW: 'view',
+  EDITOR: 'editor',
+  REVIEW: 'review'
+}
+
+export const BLOCK_COMMAND_IDS = {
+  paragraph: 'editor.block.paragraph',
+  h1: 'editor.block.h1',
+  h2: 'editor.block.h2',
+  h3: 'editor.block.h3',
+  h4: 'editor.block.h4',
+  h5: 'editor.block.h5',
+  h6: 'editor.block.h6'
+}
+
+export const LEGACY_COMMAND_ALIASES = {
+  new: 'file.new',
+  open: 'file.open',
+  openFolder: 'workspace.openFolder',
+  save: 'file.save',
+  saveAs: 'file.saveAs',
+  renameFile: 'file.rename',
+  fileHistory: 'file.history',
+  deletedFiles: 'file.deleted',
+  attachFile: 'file.attach',
+  exportPdf: 'file.exportPdf',
+  exportHtml: 'file.exportHtml',
+  exportPandocDocx: 'file.exportPandocDocx',
+  exportPandocEpub: 'file.exportPandocEpub',
+  exportPandocLatex: 'file.exportPandocLatex',
+  exportPandocOdt: 'file.exportPandocOdt',
+  exportPandocRtf: 'file.exportPandocRtf',
+  exportPandocMediawiki: 'file.exportPandocMediawiki',
+  exportPandocTxt: 'file.exportPandocTxt',
+  closeTab: 'tab.close',
+  nextTab: 'tab.next',
+  previousTab: 'tab.previous',
+  palette: 'view.commandPalette',
+  toggleSidebar: 'view.toggleSidebar',
+  toggleImmersive: 'view.immersive',
+  toggleReadingMode: 'view.readingMode',
+  toggleFiles: 'view.showFiles',
+  toggleOutline: 'view.showOutline',
+  headingFoldToggle: 'editor.fold.toggle',
+  headingFoldAll: 'editor.fold.all',
+  headingUnfoldAll: 'editor.fold.none',
+  globalSearch: 'view.globalSearch',
+  toggleSource: 'view.toggleSource',
+  toggleTheme: 'view.cycleTheme',
+  find: 'editor.find',
+  replace: 'editor.replace',
+  reviewAdd: 'review.add',
+  reviewDelete: 'review.delete',
+  reviewSubstitute: 'review.substitute',
+  reviewHighlight: 'review.highlight',
+  reviewCopyPrompt: 'review.copyPrompt',
+  reviewAcceptAll: 'review.acceptAll',
+  reviewRejectAll: 'review.rejectAll'
+}
+
+export const COMMAND_DEFINITIONS = [
+  {
+    id: 'file.new',
+    handler: 'new',
+    titleKey: 'cmd.new',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+N'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    id: 'file.open',
+    handler: 'open',
+    titleKey: 'cmd.open',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+O'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    id: 'workspace.openFolder',
+    handler: 'openFolder',
+    titleKey: 'cmd.openFolder',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+O'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    id: 'file.save',
+    handler: 'save',
+    titleKey: 'cmd.save',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: ['Mod+S'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    id: 'file.saveAs',
+    handler: 'saveAs',
+    titleKey: 'cmd.saveAs',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: ['Mod+Shift+S'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    // F2 (issue #156): the file-tree row that has focus, else the current
+    // document — inline in the file tree when its row is showing, otherwise
+    // the rename dialog. Renderer-only, like view.toggleSidebar.
+    id: 'file.rename',
+    handler: 'renameFile',
+    titleKey: 'cmd.renameFile',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['F2'],
+    palette: true
+  },
+  {
+    // Local version history of the current document / recently deleted
+    // files (lib/history-ui.js). Renderer-only; hidden where the preload has
+    // no history store (mobile).
+    id: 'file.history',
+    handler: 'fileHistory',
+    titleKey: 'cmd.fileHistory',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: [],
+    requiresApi: 'historyList',
+    palette: true
+  },
+  {
+    id: 'file.deleted',
+    handler: 'deletedFiles',
+    titleKey: 'cmd.recentlyDeleted',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: [],
+    requiresApi: 'historyList',
+    palette: true
+  },
+  {
+    id: 'file.attach',
+    handler: 'attachFile',
+    titleKey: 'cmd.attachFile',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    electronAccelerator: true,
+    capability: 'fileAttachments',
+    palette: true
+  },
+  {
+    id: 'file.exportPdf',
+    handler: 'exportPdf',
+    titleKey: 'cmd.exportPdf',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: ['Mod+Shift+E'],
+    electronAccelerator: true,
+    capability: 'pdfExport',
+    palette: true
+  },
+  {
+    id: 'file.exportHtml',
+    handler: 'exportHtml',
+    titleKey: 'cmd.exportHtml',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    electronAccelerator: true,
+    capability: 'htmlExport',
+    palette: true
+  },
+  ...[
+    ['Docx', 'cmd.exportPandocDocx'],
+    ['Epub', 'cmd.exportPandocEpub'],
+    ['Latex', 'cmd.exportPandocLatex'],
+    ['Odt', 'cmd.exportPandocOdt'],
+    ['Rtf', 'cmd.exportPandocRtf'],
+    ['Mediawiki', 'cmd.exportPandocMediawiki'],
+    ['Txt', 'cmd.exportPandocTxt']
+  ].map(([suffix, titleKey]) => ({
+    id: `file.exportPandoc${suffix}`,
+    handler: `exportPandoc${suffix}`,
+    titleKey,
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    electronAccelerator: true,
+    capability: 'pandocExport',
+    palette: true
+  })),
+  {
+    id: 'tab.close',
+    handler: 'closeTab',
+    titleKey: 'cmd.closeTab',
+    fallbackTitle: 'Close Tab',
+    category: COMMAND_CATEGORIES.FILE,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: ['Mod+W'],
+    electronAccelerator: true
+  },
+  {
+    id: 'tab.next',
+    handler: 'nextTab',
+    titleKey: 'cmd.nextTab',
+    fallbackTitle: 'Next Tab',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Ctrl+Tab']
+  },
+  {
+    id: 'tab.previous',
+    handler: 'previousTab',
+    titleKey: 'cmd.previousTab',
+    fallbackTitle: 'Previous Tab',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Ctrl+Shift+Tab']
+  },
+  {
+    id: 'view.commandPalette',
+    handler: 'palette',
+    titleKey: 'cmd.palette',
+    fallbackTitle: 'Command Palette',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+P'],
+    electronAccelerator: true
+  },
+  {
+    id: 'view.toggleSidebar',
+    handler: 'toggleSidebar',
+    titleKey: 'cmd.sidebar',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+B'],
+    palette: true
+  },
+  {
+    // Full-screen reading/editing (Typora-style): hides every shell element
+    // and leaves only the document. Renderer-only (no menu accelerator), like
+    // the sidebar toggle, so the shortcut cannot double-fire.
+    id: 'view.immersive',
+    handler: 'toggleImmersive',
+    titleKey: 'cmd.immersive',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+Enter'],
+    palette: true
+  },
+  {
+    // Reading mode (#163): documents become read-only so selecting and
+    // copying can never edit them. Renderer-only, like view.immersive.
+    id: 'view.readingMode',
+    handler: 'toggleReadingMode',
+    titleKey: 'cmd.readingMode',
+    fallbackTitle: 'Reading Mode',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+R'],
+    palette: true
+  },
+  {
+    id: 'view.showFiles',
+    handler: 'toggleFiles',
+    titleKey: 'cmd.files',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'view.showOutline',
+    handler: 'toggleOutline',
+    titleKey: 'cmd.outline',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+L'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    // Outline fold all (#122). Renderer-only capture-phase shortcuts (no menu
+    // accelerator, no double fire); they act on the active document's fold
+    // memory, so they also work while the outline panel is hidden.
+    // ProseMirror owns Mod+[ / Mod+] (list lift/sink), not Mod+Alt+[ / ].
+    id: 'outline.expandAll',
+    handler: 'outlineExpandAll',
+    titleKey: 'cmd.outlineExpandAll',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Alt+BracketRight'],
+    palette: true
+  },
+  {
+    id: 'outline.collapseAll',
+    handler: 'outlineCollapseAll',
+    titleKey: 'cmd.outlineCollapseAll',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Alt+BracketLeft'],
+    palette: true
+  },
+  {
+    // Heading folds in the document (view-only). Renderer-only capture
+    // listeners like the outline ones, so they also work in reading mode
+    // (focus leaves the read-only editor, ProseMirror keymaps never run).
+    id: 'editor.fold.toggle',
+    handler: 'headingFoldToggle',
+    titleKey: 'cmd.foldHeading',
+    fallbackTitle: 'Fold / Unfold Heading',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Alt+Period'],
+    palette: true
+  },
+  {
+    id: 'editor.fold.all',
+    handler: 'headingFoldAll',
+    titleKey: 'cmd.foldAllHeadings',
+    fallbackTitle: 'Fold All Headings',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'editor.fold.none',
+    handler: 'headingUnfoldAll',
+    titleKey: 'cmd.unfoldAllHeadings',
+    fallbackTitle: 'Unfold All Headings',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'view.globalSearch',
+    handler: 'globalSearch',
+    titleKey: 'cmd.globalSearch',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+F'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    id: 'view.toggleSource',
+    handler: 'toggleSource',
+    titleKey: 'cmd.source',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: ['Mod+Slash'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    id: 'view.cycleTheme',
+    handler: 'toggleTheme',
+    titleKey: 'cmd.theme',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+T'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    // Unlike the other commands this one is NOT an Electron menu accelerator:
+    // it is registered in the main process with globalShortcut so it also works
+    // while the window is hidden to the tray. The renderer still owns the
+    // binding (recording, persistence, conflicts) and pushes the resolved
+    // accelerator to main; see buildGlobalAcceleratorPayload + the
+    // 'window:setGlobalShortcuts' IPC.
+    id: 'window.toggleVisibility',
+    handler: 'toggleWindowVisibility',
+    titleKey: 'cmd.toggleWindow',
+    fallbackTitle: 'Show / Hide Window',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Alt+M'],
+    globalAccelerator: true,
+    capability: 'globalShortcuts',
+    palette: true
+  },
+  {
+    id: 'editor.find',
+    handler: 'find',
+    titleKey: 'cmd.find',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: ['Mod+F'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
+    id: 'editor.replace',
+    handler: 'replace',
+    titleKey: 'cmd.replace',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: ['Mod+Alt+F'],
+    palette: true
+  },
+  {
+    id: 'editor.bold',
+    titleKey: 'cmd.bold',
+    fallbackTitle: 'Bold',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.EDITOR,
+    defaultKeybindings: ['Mod+B'],
+    editorOwned: true,
+    configurable: false
+  },
+  {
+    id: 'editor.italic',
+    titleKey: 'cmd.italic',
+    fallbackTitle: 'Italic',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.EDITOR,
+    defaultKeybindings: ['Mod+I'],
+    editorOwned: true,
+    configurable: false
+  },
+  {
+    id: 'editor.highlight',
+    titleKey: 'cmd.highlight',
+    fallbackTitle: 'Highlight',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.EDITOR,
+    defaultKeybindings: ['Mod+Alt+H'],
+    editorOwned: true,
+    configurable: false
+  },
+  {
+    id: 'editor.code.exit',
+    fallbackTitle: 'Exit Code Block',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.EDITOR,
+    defaultKeybindings: ['Mod+Enter'],
+    editorOwned: true,
+    configurable: false
+  },
+  {
+    id: 'editor.block.paragraph',
+    titleKey: 'block.paragraph',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.EDITOR,
+    defaultKeybindings: ['Mod+0'],
+    editorOwned: true
+  },
+  ...[1, 2, 3, 4, 5, 6].map((level) => ({
+    id: `editor.block.h${level}`,
+    titleKey: `block.h${level}`,
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.EDITOR,
+    defaultKeybindings: [`Mod+${level}`],
+    editorOwned: true
+  })),
+  {
+    id: 'review.add',
+    handler: 'reviewAdd',
+    titleKey: 'cmd.reviewAdd',
+    category: COMMAND_CATEGORIES.REVIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'review.delete',
+    handler: 'reviewDelete',
+    titleKey: 'cmd.reviewDelete',
+    category: COMMAND_CATEGORIES.REVIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'review.substitute',
+    handler: 'reviewSubstitute',
+    titleKey: 'cmd.reviewSubstitute',
+    category: COMMAND_CATEGORIES.REVIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'review.highlight',
+    handler: 'reviewHighlight',
+    titleKey: 'cmd.reviewHighlight',
+    category: COMMAND_CATEGORIES.REVIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'review.copyPrompt',
+    handler: 'reviewCopyPrompt',
+    titleKey: 'cmd.reviewCopyPrompt',
+    category: COMMAND_CATEGORIES.REVIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'review.acceptAll',
+    handler: 'reviewAcceptAll',
+    titleKey: 'cmd.reviewAcceptAll',
+    category: COMMAND_CATEGORIES.REVIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    palette: true
+  },
+  {
+    id: 'review.rejectAll',
+    handler: 'reviewRejectAll',
+    titleKey: 'cmd.reviewRejectAll',
+    category: COMMAND_CATEGORIES.REVIEW,
+    context: COMMAND_CONTEXTS.DOCUMENT,
+    defaultKeybindings: [],
+    palette: true
+  }
+]
+
+export const COMMAND_BY_ID = Object.fromEntries(COMMAND_DEFINITIONS.map((command) => [command.id, command]))
+export const COMMAND_BY_HANDLER = Object.fromEntries(
+  COMMAND_DEFINITIONS.filter((command) => command.handler).map((command) => [command.handler, command])
+)
+
+export function resolveCommandId(commandIdOrAlias) {
+  if (COMMAND_BY_ID[commandIdOrAlias]) return commandIdOrAlias
+  return LEGACY_COMMAND_ALIASES[commandIdOrAlias] || null
+}
+
+export function getCommandHandler(commandIdOrAlias) {
+  const commandId = resolveCommandId(commandIdOrAlias)
+  return commandId ? COMMAND_BY_ID[commandId]?.handler || null : null
+}
+
+export function getCommandTitle(command, t) {
+  const title = command.titleKey ? t(command.titleKey) : ''
+  if (title && title !== command.titleKey) return title
+  return command.fallbackTitle || command.id
+}
+
+export function isCommandAvailable(command, capabilities = {}) {
+  if (command.capability && capabilities[command.capability] === false) return false
+  // A command backed by an optional preload API (e.g. history on mobile).
+  if (command.requiresApi && typeof window !== 'undefined' && typeof window.api?.[command.requiresApi] !== 'function') return false
+  return true
+}

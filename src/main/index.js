@@ -1,0 +1,1257 @@
+import { app, BrowserWindow, ipcMain, Menu, shell, net, safeStorage, session, clipboard, Tray, nativeImage, globalShortcut } from 'electron'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { dirname, join, basename, extname, resolve, sep } from 'node:path'
+import fs from 'node:fs/promises'
+import { existsSync, statSync, realpathSync, constants as fsConstants } from 'node:fs'
+import { exec } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import { canGrantLocalFonts, createLocalFontGrant, getAllowedExternalUrl } from './security.js'
+import { registerDocumentIpc } from './documents.js'
+import { registerFileSystemIpc } from './filesystem.js'
+import { registerSyncWorkspaceIpc } from './sync-workspaces.js'
+import { registerSyncServiceIpc, SyncService } from './sync-service.js'
+import { initHistory, registerHistoryIpc, syncHistory } from './history/history-service.js'
+import { createElectronRequest } from './sync/electron-request.js'
+import { registerUpdater } from './updater.js'
+import { registerWatcherIpc } from './watchers.js'
+import { registerGlobalSearchIpc } from './globalsearch.js'
+import { defaultMenuAcceleratorFor, menuAcceleratorFor, normalizeMenuKeybindingPayload } from './menu-keybindings.js'
+import { loadThemeCss } from './theme-css.js'
+import { userCommandEnv, userCommandPath } from './shell-path.js'
+import {
+  initOfflineMode,
+  installOfflineNetworkGuard,
+  isOffline,
+  offlineFetch,
+  onOfflineEnabled,
+  setOfflineMode
+} from './offline.js'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// Independent product identity (also used by the packaged build).
+app.setName('QuillMD')
+app.setAppUserModelId('com.quillmd.app')
+// Offline mode must be known before the renderer mounts: its first effects call
+// update:check and schedule automatic cloud sync.
+initOfflineMode(app)
+// Disable Chromium's own background services unconditionally. They are not app
+// features (component updates, domain reliability, pings); the app's explicit
+// network paths remain available when offline mode is off.
+app.commandLine.appendSwitch('disable-background-networking')
+app.commandLine.appendSwitch('disable-component-update')
+app.commandLine.appendSwitch('disable-domain-reliability')
+app.commandLine.appendSwitch('no-pings')
+
+// Supported Markdown file types — single source for the open-dialog filter and
+// the extension test used while scanning folders / launch args.
+const MD_EXTS = ['md', 'markdown', 'mdx', 'txt']
+const MD_RE = new RegExp(`\\.(${MD_EXTS.join('|')})$`, 'i')
+// Pre-sync default for the global show/hide accelerator. The renderer owns the
+// real default (command-definitions.js → 'window.toggleVisibility') and pushes
+// the user's effective binding as soon as it mounts; this only covers the gap.
+const DEFAULT_TOGGLE_WINDOW_SHORTCUT = 'Alt+M'
+// OS-level shortcuts must be registered here (globalShortcut), but the binding
+// itself is user-configurable in the renderer. The renderer may only bind
+// commands in this whitelist — anything else in the payload is ignored, so a
+// compromised renderer cannot hook arbitrary system-wide keys.
+const GLOBAL_COMMANDS = {
+  'window.toggleVisibility': () => toggleMainWindow()
+}
+const backgroundTestMode = process.argv.includes('--horsemd-test-background')
+const inputTraceEnabled = process.argv.includes('--horsemd-input-trace')
+
+let mainWindow = null
+// When true, the window is allowed to close without re-prompting (the renderer
+// has confirmed there are no unsaved changes, or the user chose to discard).
+let allowClose = false
+// True once a real app quit is underway (Cmd/Ctrl+Q, menu Quit). Lets the close
+// handler tell "quit the app" apart from "just close the window" (macOS keeps the
+// app running on window close, but Cmd+Q must fully quit).
+let isQuitting = false
+let localFontGrant = null
+let rendererReady = false
+// Tray icon that keeps the app reachable while the window is hidden. Held in a
+// module variable so it isn't garbage-collected (which would remove the icon).
+let tray = null
+// Settings › General "close to tray". The renderer owns the persisted value and
+// pushes it here on mount. Default OFF on both sides: "close quits" stays the
+// long-standing behavior; the tray is opt-in from Settings › General.
+let closeToTray = false
+// Registered OS-level accelerators: command id -> accelerator. Rebuilt whenever
+// the renderer pushes the user's effective keybindings.
+let globalShortcuts = new Map()
+// Image-host uploader child processes (PicGo.exe, custom commands). Offline
+// mode kills them mid-run; PicGo's local HTTP upload is covered by offlineFetch.
+const activeUploadCommands = new Set()
+onOfflineEnabled(() => {
+  for (const child of [...activeUploadCommands]) {
+    try { child.kill() } catch { /* already exited */ }
+  }
+})
+
+const inputTracePath = () => join(app.getPath('temp'), `horsemd-input-trace-${process.pid}.jsonl`)
+let inputTraceQueue = Promise.resolve()
+
+// Preload asks synchronously so normal builds do not install per-event input
+// listeners or send IPC traffic. The actual trace writer is also gated here,
+// making the feature unavailable unless the process was explicitly launched
+// with --horsemd-input-trace.
+ipcMain.on('debug:inputTraceEnabled', (event) => {
+  event.returnValue = inputTraceEnabled
+})
+ipcMain.handle('debug:inputTraceInfo', () => ({
+  enabled: inputTraceEnabled,
+  path: inputTraceEnabled ? inputTracePath() : null
+}))
+ipcMain.handle('debug:inputTrace', (event, entry) => {
+  if (!inputTraceEnabled || !mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+  let line
+  try {
+    const payload = entry && typeof entry === 'object' ? entry : { value: String(entry ?? '') }
+    line = JSON.stringify({ pid: process.pid, ...payload }) + '\n'
+  } catch {
+    return false
+  }
+  // Avoid turning a malformed renderer payload into an unbounded log file.
+  if (line.length > 2 * 1024 * 1024) return false
+  inputTraceQueue = inputTraceQueue
+    .catch(() => {})
+    .then(() => fs.appendFile(inputTracePath(), line, 'utf8'))
+  return inputTraceQueue.then(() => true).catch(() => false)
+})
+
+// ---- Safety net: never let a stray async error abort the whole app ----
+// chokidar (and other fs/network async work) can reject with EACCES/EPERM when
+// it touches a path we can't read — e.g. watching a folder whose subtree
+// includes restricted system files. With Node's default unhandled-rejection
+// behaviour an unhandled one of these would crash (SIGABRT) the main process on
+// launch. Log and swallow instead; the watcher's own error handler does the rest.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (ignored):', reason?.message || reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (ignored):', err?.message || err)
+})
+
+// ---- Single instance: route any second launch into the existing window ----
+const gotLock = app.requestSingleInstanceLock()
+if (!gotLock) {
+  app.quit()
+} else {
+  app.on('second-instance', (_e, argv) => {
+    const { files, folders } = extractArgs(argv)
+    focusMainWindow()
+    // macOS keeps the process alive after its final window closes. A new launch
+    // reaches this handler before a replacement renderer is ready, so queue its
+    // paths instead of sending them into a missing (or still loading) window.
+    if (!rendererReady) {
+      enqueueLaunch(files, folders)
+      return
+    }
+    if (folders.length) sendToRenderer('open-folder', folders[0])
+    if (files.length) sendToRenderer('open-paths', files)
+  })
+}
+
+// ---- First-launch open queue (#36): argv files (Win/Linux) and open-file
+// events (macOS) arrive before the renderer has registered its open-paths
+// listener. Hold them until the renderer signals 'app-ready', then deliver —
+// otherwise the launched file is lost and the restored session shows instead.
+let pendingLaunch = { files: [], folders: [] }
+ipcMain.on('app-ready', () => {
+  rendererReady = true
+  const { files, folders } = pendingLaunch
+  pendingLaunch = { files: [], folders: [] }
+  if (folders.length) sendToRenderer('open-folder', folders[0])
+  if (files.length) sendToRenderer('open-paths', files)
+})
+
+function enqueueLaunch(files = [], folders = []) {
+  for (const file of files) {
+    if (!pendingLaunch.files.includes(file)) pendingLaunch.files.push(file)
+  }
+  for (const folder of folders) {
+    if (!pendingLaunch.folders.includes(folder)) pendingLaunch.folders.push(folder)
+  }
+}
+
+// Split launch args into markdown files and folders. A folder argument (from
+// the Explorer "Open with QuillMD" folder menu) opens as a workspace; markdown
+// files open as tabs. Non-existent paths and flags are ignored.
+function extractArgs(argv) {
+  const files = []
+  const folders = []
+  // The app's own directory (in dev, argv includes "." / the project path). Never
+  // open it as a workspace — that's how a bogus relative/CWD workspace slipped in.
+  let appDir = null
+  try {
+    appDir = resolve(app.getAppPath())
+  } catch {
+    /* not ready yet */
+  }
+  for (const a of argv.slice(1)) {
+    if (a.startsWith('-')) continue
+    // Resolve to an absolute path so a relative arg (e.g. ".") never becomes a
+    // workspace that later resolves against the process CWD.
+    const abs = resolve(a)
+    if (appDir && abs === appDir) continue
+    if (!existsSync(abs)) continue
+    let st
+    try {
+      st = statSync(abs)
+    } catch {
+      continue
+    }
+    if (st.isDirectory()) folders.push(abs)
+    else if (MD_RE.test(abs)) files.push(abs)
+  }
+  return { files, folders }
+}
+
+// ---- Tray / show-hide window ---------------------------------------------
+// "Close to tray" keeps the app running when the window is closed: the window is
+// hidden instead, and the tray icon (or the global Alt+M shortcut) brings it
+// back. A real quit still goes through the renderer's unsaved-changes confirm.
+function trayIconPath() {
+  // Packaged: electron-builder copies build/icons/32x32.png -> <resources>/icons.
+  const packaged = join(process.resourcesPath, 'icons', '32x32.png')
+  if (existsSync(packaged)) return packaged
+  // Dev: app.getAppPath() is the project root.
+  return join(app.getAppPath(), 'build', 'icons', '32x32.png')
+}
+
+// The native application menu is English-only, but the tray is the one surface
+// a user sees while the window is hidden — follow the OS locale there.
+function trayLabels() {
+  const zh = String(app.getLocale?.() || '').toLowerCase().startsWith('zh')
+  return zh
+    ? { toggle: '显示 / 隐藏 QuillMD', quit: '退出 QuillMD' }
+    : { toggle: 'Show / Hide QuillMD', quit: 'Quit QuillMD' }
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (app.isReady()) createWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function hideMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide()
+}
+
+function toggleMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (app.isReady()) createWindow()
+    return
+  }
+  // Visible AND focused -> hide. Anything else (hidden, minimized, or behind
+  // another window) -> bring it to the front.
+  if (!mainWindow.isMinimized() && mainWindow.isVisible() && mainWindow.isFocused()) {
+    hideMainWindow()
+  } else {
+    showMainWindow()
+  }
+}
+
+// Tray "Quit". The window is shown first so the renderer's unsaved-changes
+// confirm (a page dialog) is visible; isQuitting makes the window 'close'
+// handler treat it as a quit instead of another hide-to-tray.
+function quitApp() {
+  isQuitting = true
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    app.quit()
+    return
+  }
+  showMainWindow()
+  mainWindow.close()
+}
+
+// The tray menu mirrors the current global accelerator, so it stays correct
+// after the user rebinds (or clears) the show/hide shortcut.
+function rebuildTrayMenu() {
+  if (!tray) return
+  const labels = trayLabels()
+  const accelerator = globalShortcuts.get('window.toggleVisibility') || ''
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: labels.toggle, accelerator: accelerator || undefined, click: () => toggleMainWindow() },
+    { type: 'separator' },
+    { label: labels.quit, click: () => quitApp() }
+  ]))
+}
+
+function createTray() {
+  if (tray) return
+  let image = null
+  try {
+    const iconPath = trayIconPath()
+    if (existsSync(iconPath)) image = nativeImage.createFromPath(iconPath)
+  } catch {
+    /* fall through — no usable icon means no tray */
+  }
+  if (!image || image.isEmpty()) return
+  // Linux without a system tray (headless / some Wayland sessions) makes the
+  // Tray constructor itself throw — the app must still start (the watcher
+  // EACCES lesson: environment variance can never abort launch).
+  try {
+    tray = new Tray(image)
+  } catch {
+    tray = null
+    return
+  }
+  tray.setToolTip('QuillMD')
+  rebuildTrayMenu()
+  // Windows/Linux: a plain left click toggles the window (right click still
+  // opens the context menu). macOS shows the menu on click, per platform norms.
+  if (process.platform !== 'darwin') tray.on('click', () => toggleMainWindow())
+}
+
+function destroyTray() {
+  if (!tray) return
+  try {
+    tray.destroy()
+  } catch {
+    /* already gone */
+  }
+  tray = null
+}
+
+// Replace the whole set of app-owned global accelerators. Called once at startup
+// with the default and again whenever the renderer's effective keybindings
+// change. Returns the accelerators that actually registered plus the command ids
+// the OS/another app already owns (the settings UI warns about those).
+function applyGlobalShortcuts(payload) {
+  for (const accelerator of globalShortcuts.values()) {
+    try {
+      globalShortcut.unregister(accelerator)
+    } catch {
+      /* already released (e.g. a later registration failed) — ignore */
+    }
+  }
+  globalShortcuts = new Map()
+  const unregistered = []
+  for (const [commandId, accelerator] of Object.entries(payload || {})) {
+    const action = GLOBAL_COMMANDS[commandId]
+    if (!action) continue
+    if (typeof accelerator !== 'string' || !accelerator.trim() || accelerator.length > 80) continue
+    let registered = false
+    try {
+      registered = globalShortcut.register(accelerator, action)
+    } catch {
+      /* invalid accelerator string — leave the command unbound */
+      registered = false
+    }
+    if (registered) globalShortcuts.set(commandId, accelerator)
+    else unregistered.push(commandId)
+  }
+  rebuildTrayMenu()
+  return {
+    ok: true,
+    accelerators: Object.fromEntries(globalShortcuts),
+    unregistered
+  }
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (app.isReady()) createWindow()
+    return false
+  }
+  if (backgroundTestMode) return true
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+  return true
+}
+
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed() && rendererReady) {
+    mainWindow.webContents.send(channel, payload)
+  }
+}
+
+async function openExternalUrl(url) {
+  if (isOffline()) {
+    return { ok: false, offline: true, error: '离线模式已开启，已阻止打开外部链接。' }
+  }
+  const allowedUrl = getAllowedExternalUrl(url)
+  if (!allowedUrl) return { ok: false, error: 'Unsupported external URL.' }
+  await shell.openExternal(allowedUrl)
+  return { ok: true }
+}
+
+function createWindow() {
+  rendererReady = false
+  mainWindow = new BrowserWindow({
+    width: 1280,
+    height: 820,
+    minWidth: 720,
+    minHeight: 480,
+    show: false,
+    backgroundColor: '#1a1b20',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    // macOS: place the traffic lights at a fixed spot so the renderer can
+    // reserve a matching gap (see `.app.is-mac` rules in app.css). y centers the
+    // ~12px buttons within the 40px top bar.
+    trafficLightPosition: process.platform === 'darwin' ? { x: 14, y: 14 } : undefined,
+    // Windows/Linux: no native caption-button overlay — the renderer draws its
+    // own minimize / maximize / close controls (so they can have custom hover
+    // states). macOS keeps its native traffic lights via hiddenInset above.
+    titleBarOverlay: false,
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.mjs'),
+      // Security: keep the renderer isolated from Node. These are Electron's
+      // defaults, but we set them explicitly so the posture is obvious and
+      // robust against future default changes. sandbox stays off because the
+      // preload is an ES module (the sandbox requires a CommonJS preload).
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      spellcheck: true,
+      backgroundThrottling: !backgroundTestMode
+    }
+  })
+
+  mainWindow.once('ready-to-show', () => {
+    if (!backgroundTestMode) focusMainWindow()
+    // Launch files/folders are delivered on the renderer's 'app-ready' signal
+    // (see pendingLaunch below) — sending here races the renderer's IPC listener
+    // registration, and the double-clicked file is lost to the restored session
+    // (issue #36).
+  })
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    void openExternalUrl(url)
+    return { action: 'deny' }
+  })
+
+  // Security: never let the window navigate away from our own app content
+  // (e.g. a malicious link in a Markdown file). Open external URLs in the
+  // user's browser instead.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const devUrl = process.env.ELECTRON_RENDERER_URL
+    if (devUrl && url.startsWith(devUrl)) return
+    event.preventDefault()
+    void openExternalUrl(url)
+  })
+
+  // Keep the renderer's maximize/restore button icon in sync with the real
+  // window state (e.g. double-click drag-to-maximize, OS shortcuts).
+  const emitMaxState = () => sendToRenderer('window:maximized', mainWindow?.isMaximized() ?? false)
+  mainWindow.on('maximize', emitMaxState)
+  mainWindow.on('unmaximize', emitMaxState)
+
+
+  // Warn about unsaved changes before the window closes (macOS traffic light,
+  // the custom Windows close button, Cmd/Ctrl+Q). The dirty state lives in the
+  // renderer, so defer the close and ask it; it calls back via 'app:confirm-close'
+  // (proceed) or 'app:cancel-close' (abort).
+  allowClose = false
+  mainWindow.on('close', (e) => {
+    if (allowClose) return
+    e.preventDefault()
+    // Closing to the tray keeps the app (and every open tab) alive, so the
+    // renderer only has to flush pending edits — no unsaved-changes confirm.
+    sendToRenderer('app-close-request', { closeToTray: closeToTray && !isQuitting })
+  })
+
+  if (process.env.ELECTRON_RENDERER_URL) {
+    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+  } else {
+    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+  }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null
+    rendererReady = false
+  })
+}
+
+// macOS: opening a file from Finder
+app.on('open-file', (event, path) => {
+  event.preventDefault()
+  if (rendererReady && focusMainWindow()) {
+    sendToRenderer('open-paths', [path])
+  } else {
+    // First launch: queue for the renderer's app-ready handshake (#36).
+    enqueueLaunch([path])
+    focusMainWindow()
+  }
+})
+
+app.whenReady().then(() => {
+  // Resolve the login-shell PATH in the background, so the first pasted image
+  // does not wait for it (issue #160).
+  userCommandPath().catch(() => {})
+  // Win/Linux: argv carries the launched file/folder. Merge into the launch
+  // queue (macOS open-file events already pushed above). Delivered on the
+  // renderer's app-ready signal (#36).
+  const launched = extractArgs(process.argv)
+  enqueueLaunch(launched.files, launched.folders)
+  ensureThemesDir()
+  buildMenu()
+  const allowLocalFonts = (webContents, permission, requestingUrl, isMainFrame) =>
+    canGrantLocalFonts({
+      permission,
+      webContentsId: webContents?.id,
+      trustedWebContentsId: mainWindow?.webContents.id,
+      requestingUrl,
+      currentUrl: webContents?.getURL() || '',
+      devRendererUrl: process.env.ELECTRON_RENDERER_URL,
+      isMainFrame,
+      grant: localFontGrant
+    })
+
+  // Electron 34 reports Local Font Access as either `local-fonts` or `unknown`,
+  // depending on the Chromium path. Only grant it briefly after the settings UI
+  // explicitly requests font enumeration; every other permission stays denied.
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    callback(allowLocalFonts(webContents, permission, details?.requestingUrl || '', details?.isMainFrame))
+  })
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) =>
+    allowLocalFonts(webContents, permission, details?.requestingUrl || requestingOrigin, details?.isMainFrame)
+  )
+  // One choke point for renderer-originated network: remote Markdown images,
+  // media embeds/iframes, hidden export windows, and Electron net requests that
+  // use the default session. Main-process call sites also check isOffline().
+  installOfflineNetworkGuard(session.defaultSession)
+  createWindow()
+  // The tray icon exists only while "close to tray" is enabled — the renderer
+  // pushes the preference on mount, which (re)creates or destroys it below.
+  // Default off: no tray icon for users who never opt in.
+  // Pre-sync default; the renderer replaces it with the user's effective binding
+  // ('window:setGlobalShortcuts') as soon as it has loaded the keybinding store.
+  applyGlobalShortcuts({ 'window.toggleVisibility': DEFAULT_TOGGLE_WINDOW_SHORTCUT })
+  if (inputTraceEnabled) {
+    console.log(`QuillMD input trace: ${inputTracePath()}`)
+  }
+  app.on('activate', () => {
+    // macOS dock click: also restores a window that was hidden to the tray (the
+    // window still exists, it's just not visible), and recreates a closed one.
+    showMainWindow()
+  })
+})
+
+ipcMain.handle('permissions:allowLocalFonts', (event) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+  localFontGrant = createLocalFontGrant(event.sender.id)
+  return true
+})
+
+// A real quit is starting (Cmd/Ctrl+Q, menu Quit, app.quit()). Mark it so the
+// window 'close' handler quits the app rather than just closing the window.
+app.on('before-quit', () => {
+  isQuitting = true
+})
+
+// Global accelerators are process-wide; release them on the way out so a
+// relaunch (or another app) can register the same combination again.
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+  // A downloaded update the user chose to install starts now (detached).
+  updater.runPendingInstall()
+})
+
+app.on('window-all-closed', () => {
+  // With close-to-tray on, the window is hidden rather than closed, so this
+  // only fires for a real quit — or when the user turned close-to-tray off.
+  if (process.platform !== 'darwin' && !closeToTray) app.quit()
+})
+
+// ----------------------------- IPC: file system -----------------------------
+
+registerDocumentIpc(ipcMain, {
+  getMainWindow: () => mainWindow,
+  getUserDataPath: () => app.getPath('userData'),
+  markdownExtensions: MD_EXTS,
+  isTrustedSender: (event) => !!mainWindow && event.sender.id === mainWindow.webContents.id
+})
+
+registerFileSystemIpc(ipcMain, { shell, markdownPattern: MD_RE })
+
+// Local version history (docs/cloud-sync-review.md P1): userData/history.
+initHistory(() => join(app.getPath('userData'), 'history'))
+registerHistoryIpc(ipcMain)
+
+// Workspace-wide content search (issue #120) — same markdownPattern so the
+// search scope is exactly what the sidebar tree shows.
+registerGlobalSearchIpc(ipcMain, { markdownPattern: MD_RE })
+
+registerSyncWorkspaceIpc(ipcMain, {
+  getUserDataPath: () => app.getPath('userData'),
+  isTrustedSender: (event) => !!mainWindow && event.sender.id === mainWindow.webContents.id
+})
+const syncService = new SyncService({
+  getUserDataPath: () => app.getPath('userData'),
+  safeStorage,
+  // net.request, not net.fetch: 七牛 sends non-ASCII header bytes that make
+  // net.fetch hang (sync/electron-request.js).
+  request: createElectronRequest(net),
+  // Files the sync replaces or deletes are kept in the local history.
+  history: syncHistory,
+  // Sync requests in the input trace (#161): method, URL, status, timing.
+  traceLog: inputTraceEnabled
+    ? (entry) => {
+      const line = JSON.stringify({ pid: process.pid, t: Date.now(), ...entry }) + '\n'
+      inputTraceQueue = inputTraceQueue.catch(() => {}).then(() => fs.appendFile(inputTracePath(), line, 'utf8'))
+    }
+    : null
+})
+registerSyncServiceIpc(ipcMain, {
+  syncService,
+  isOffline,
+  isTrustedSender: (event) => !!mainWindow && event.sender.id === mainWindow.webContents.id,
+  sendToRenderer
+})
+
+registerWatcherIpc(ipcMain, { sendToRenderer, markdownExtensions: MD_EXTS })
+
+ipcMain.handle('shell:openExternal', async (event, url) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) {
+    return { ok: false, error: 'Untrusted renderer.' }
+  }
+  return openExternalUrl(url)
+})
+ipcMain.handle('shell:openFileUrl', async (event, url) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) {
+    return { ok: false, error: 'Untrusted renderer.' }
+  }
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'file:') return { ok: false, error: 'Only file:// URLs are supported.' }
+    const targetPath = fileURLToPath(parsed)
+    const error = await shell.openPath(targetPath)
+    return error ? { ok: false, error } : { ok: true }
+  } catch (e) {
+    return { ok: false, error: e?.message || 'Invalid file URL.' }
+  }
+})
+ipcMain.handle('shell:showInFolder', async (_e, path) => shell.showItemInFolder(path))
+ipcMain.handle('clipboard:writeText', (event, text) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+  clipboard.writeText(String(text ?? ''))
+  return true
+})
+
+// ----------------------------- custom themes -------------------------------
+// User-supplied CSS themes (e.g. migrated Typora themes) live in a `themes`
+// folder under userData. Users drop a .css file in — OR a whole downloaded theme
+// folder (Typora themes often ship as `name/coding/name.css` + assets), so we
+// scan subfolders too. The renderer lists them, reads the CSS, and injects it.
+const themesDir = () => join(app.getPath('userData'), 'themes')
+async function ensureThemesDir() {
+  try {
+    await fs.mkdir(themesDir(), { recursive: true })
+  } catch {
+    /* ignore */
+  }
+}
+
+async function collectThemeCss(dir, root, depth, acc) {
+  if (depth > 4 || acc.length > 300) return
+  let entries
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    if (e.name.startsWith('.') || e.name === 'node_modules') continue
+    const full = join(dir, e.name)
+    if (e.isDirectory()) {
+      await collectThemeCss(full, root, depth + 1, acc)
+    } else if (/\.css$/i.test(e.name)) {
+      const rel = full.slice(root.length + 1).replace(/\\/g, '/')
+      const relDir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
+      acc.push({ file: rel, name: e.name.replace(/\.css$/i, ''), dir: relDir })
+    }
+  }
+}
+
+ipcMain.handle('themes:list', async () => {
+  await ensureThemesDir()
+  const acc = []
+  await collectThemeCss(themesDir(), themesDir(), 0, acc)
+  return acc.sort((a, b) => a.name.localeCompare(b.name) || a.file.localeCompare(b.file))
+})
+
+ipcMain.handle('themes:read', async (_e, file) => {
+  // A .css path inside the themes dir (may be nested). Reject traversal.
+  if (!file || !/\.css$/i.test(file) || file.includes('..')) throw new Error('Invalid theme file.')
+  const root = resolve(themesDir())
+  const full = resolve(root, file)
+  if (full !== root && !full.startsWith(root + sep)) throw new Error('Invalid theme path.')
+  // Relative url(...) and local @import resolve against each CSS file (#154).
+  return loadThemeCss(full, root)
+})
+
+ipcMain.handle('themes:reveal', async () => {
+  await ensureThemesDir()
+  return shell.openPath(themesDir())
+})
+
+// ----------------------------- image host upload ---------------------------
+// Typora-style custom uploader: write the image bytes to a temp file, run the
+// user's command with the file path appended as an argument, and return the URL
+// it prints to stdout. PicGo-Core (`picgo upload`) and most uploaders print the
+// final URL on its own line. We parse STDOUT ONLY for the URL — stderr carries
+// warnings/errors (e.g. the AWS SDK v2 deprecation notice, whose a.co blog link
+// would otherwise be wrongly matched as the upload URL). The PicGo desktop app
+// (PicGo.exe) prints nothing useful to stdout but writes `![](url)` to the
+// clipboard — the caller falls back to that (see image:upload).
+// The command runs with the user's command-line PATH: an app started from
+// Finder / the Dock only has /usr/bin:/bin, so `picgo upload` (npm, Homebrew,
+// nvm) was "command not found" (issue #160).
+async function runUploadCommand(command, file) {
+  const env = await userCommandEnv().catch(() => process.env)
+  return new Promise((resolve) => {
+    const full = `${command} "${file}"`
+    const child = exec(
+      full,
+      { timeout: 60000, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env },
+      (err, stdout, stderr) => {
+        activeUploadCommands.delete(child)
+        resolve({
+          url: parseUploadedUrl(stdout || ''),
+          stdout: stdout || '',
+          stderr: stderr || '',
+          error: err ? (err.message || String(err)) : '',
+        })
+      }
+    )
+    activeUploadCommands.add(child)
+    child.once('error', () => activeUploadCommands.delete(child))
+  })
+}
+
+// "picgo: command not found" / "'picgo' is not recognized…": say what to do.
+function commandNotFoundHint(command, output) {
+  const text = String(output || '')
+  if (!/command not found|not found|is not recognized|No such file or directory|ENOENT/i.test(text)) return ''
+  const name = String(command).trim().split(/\s+/)[0]
+  return process.platform === 'win32'
+    ? `\n找不到命令「${name}」。请在设置里填写它的完整路径（在命令提示符里运行 where ${name} 查看）。`
+    : `\n找不到命令「${name}」。请在设置里填写它的完整路径（在终端里运行 which ${name} 查看），或确认它已安装。`
+}
+
+// PicGo desktop (and uploaders that don't print to stdout) write the result to
+// the clipboard — either as `![](url)` markdown or a bare URL. Extract the first
+// http(s) URL from the clipboard text.
+function extractClipboardUrl(text) {
+  if (!text) return null
+  const m = String(text).match(/https?:\/\/[^\s)"'<>]+/i)
+  return m ? m[0].replace(/[)\]"'.,]+$/, '') : null
+}
+
+// PicGo desktop (PicGo.exe) writes the URL to the clipboard ASYNCHRONOUSLY after
+// the upload — the `PicGo.exe upload` command returns to the prompt before the
+// upload finishes, and the clipboard is written slightly later. So a single read
+// right after the command exits races + misses it. Poll the clipboard for a
+// short window until it changes to something with a URL.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+async function waitForClipboardUrl(beforeText, timeoutMs = 6000, intervalMs = 250) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const clip = clipboard.readText()
+    if (clip && clip !== beforeText) {
+      const url = extractClipboardUrl(clip)
+      if (url) return url
+    }
+    await sleep(intervalMs)
+  }
+  return null
+}
+
+function parseUploadedUrl(out) {
+  const lines = String(out)
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  // Prefer a line that is exactly a URL (the uploader's final output line).
+  const exact = lines.filter((l) => /^https?:\/\/\S+$/i.test(l))
+  if (exact.length) return exact[exact.length - 1]
+  // Fallback: the first URL found anywhere, trimmed of trailing punctuation.
+  const m = String(out).match(/https?:\/\/\S+/i)
+  return m ? m[0].replace(/[)\]>"',.]+$/, '') : null
+}
+
+// PicGo app server upload (Typora-compatible, issue #35). The PicGo GUI app has
+// no CLI; instead it runs a local HTTP server (default 127.0.0.1:36677) that
+// accepts POST /upload with {"list": [<base64 data URI>]} and replies
+// {"success": true, "result": [url]}. We POST the image bytes as a data URI and
+// read the URL. Uses net.fetch (Chromium stack) like the update check.
+async function uploadViaServer(endpoint, name, bytes) {
+  const ext = (name || '').toLowerCase().match(/\.([a-z0-9]+)$/)?.[1]
+  const mime =
+    ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+    : ext === 'gif' ? 'image/gif'
+    : ext === 'webp' ? 'image/webp'
+    : ext === 'svg' ? 'image/svg+xml'
+    : 'image/png'
+  const dataUri = `data:${mime};base64,${Buffer.from(bytes).toString('base64')}`
+  const res = await offlineFetch((url, init) => net.fetch(url, init))(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ list: [dataUri] }),
+  })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`PicGo server HTTP ${res.status}: ${text.slice(0, 200)}`)
+  try {
+    const j = JSON.parse(text)
+    if (j && j.success && Array.isArray(j.result) && j.result[0]) return String(j.result[0])
+    if (j && j.success === false) throw new Error(j.message || 'PicGo server returned failure')
+  } catch (e) {
+    if (!(e instanceof SyntaxError)) throw e // JSON but not the expected shape
+    /* JSON parsed but the shape wasn't {success, result[]} (e.g. a bare object).
+       Salvage any URL from the body instead of failing. */
+  }
+  return parseUploadedUrl(text) // fallback: any http(s) URL in the body
+}
+
+ipcMain.handle('image:upload', async (_e, command, name, bytes) => {
+  if (isOffline()) {
+    return { ok: false, offline: true, error: '离线模式已开启，图床上传不可用。' }
+  }
+  if (!command || !String(command).trim()) return { ok: false, error: 'No upload command configured.' }
+  const cmd = String(command).trim()
+  // PicGo app server (Typora-compatible, #35): "picgo" → default server, or any
+  // http(s) URL → that endpoint. The PicGo GUI has no CLI; this is how Typora
+  // talks to it. Otherwise fall through to the shell-command uploader below.
+  let endpoint = cmd
+  if (cmd.toLowerCase() === 'picgo') endpoint = 'http://127.0.0.1:36677/upload'
+  if (/^https?:\/\//i.test(endpoint)) {
+    try {
+      const url = await uploadViaServer(endpoint, name, bytes)
+      return url ? { ok: true, url } : { ok: false, error: 'No URL in PicGo server response.' }
+    } catch (e) {
+      return { ok: false, error: e?.message || String(e) }
+    }
+  }
+  // Snapshot the clipboard BEFORE the upload — the PicGo desktop app (PicGo.exe)
+  // writes `![](url)` to the clipboard instead of stdout, so if stdout has no URL
+  // we read the clipboard + only trust it if it CHANGED during the upload (avoids
+  // returning stale clipboard content for uploaders that don't touch it).
+  const beforeClip = clipboard.readText()
+  let dir
+  try {
+    dir = await fs.mkdtemp(join(tmpdir(), 'horsemd-img-'))
+    const safe = (name || 'image.png').replace(/[\\/:*?"<>|]/g, '_') || 'image.png'
+    const file = join(dir, safe)
+    await fs.writeFile(file, Buffer.from(bytes))
+    const res = await runUploadCommand(String(command).trim(), file)
+    let url = res.url
+    // PicGo.exe writes the URL to the clipboard async (after the command
+    // returns), so poll for it instead of a single read (which races).
+    if (!url) url = await waitForClipboardUrl(beforeClip)
+    if (url) return { ok: true, url }
+    const output = (res.stderr || res.stdout || res.error || '').slice(-500)
+    return { ok: false, error: (output || 'No URL in command output or clipboard.') + commandNotFoundHint(cmd, output) }
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) }
+  } finally {
+    if (dir) fs.rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+// Pick a non-clobbering filename for `name` inside `dir`.
+const uniqueImageFile = (dir, name) => {
+  const safe = (name || 'image.png').replace(/[\\/:*?"<>|]/g, '_') || 'image.png'
+  const ext = extname(safe) || '.png'
+  const stem = basename(safe, ext) || 'image'
+  let file = join(dir, `${stem}${ext}`)
+  let n = 1
+  while (existsSync(file)) file = join(dir, `${stem}-${n++}${ext}`)
+  return file
+}
+
+const uniqueAssetFile = (dir, name) => {
+  const safe = (name || 'attachment').replace(/[\\/:*?"<>|]/g, '_') || 'attachment'
+  const ext = extname(safe)
+  const stem = ext ? basename(safe, ext) : safe
+  let file = join(dir, safe)
+  let n = 1
+  while (existsSync(file)) file = join(dir, `${stem}-${n++}${ext}`)
+  return file
+}
+
+ipcMain.handle('attachment:save', async (_e, docPath, sourcePath) => {
+  try {
+    if (!docPath) return { ok: false, error: 'Save the document before attaching files.' }
+    if (!sourcePath) return { ok: false, error: 'No attachment selected.' }
+    const st = await fs.stat(sourcePath)
+    if (!st.isFile()) return { ok: false, error: 'Only files can be attached.' }
+    const assetsDir = join(dirname(docPath), 'assets')
+    await fs.mkdir(assetsDir, { recursive: true })
+
+    const sourceReal = realpathSync(sourcePath)
+    let assetsReal = assetsDir
+    try {
+      assetsReal = realpathSync(assetsDir)
+    } catch {
+      /* just created; resolve() fallback below is enough */
+    }
+    const inAssets = sourceReal.startsWith(resolve(assetsReal) + sep)
+    if (inAssets) return { ok: true, path: 'assets/' + basename(sourcePath), name: basename(sourcePath) }
+
+    const file = uniqueAssetFile(assetsDir, basename(sourcePath))
+    await fs.copyFile(sourcePath, file, fsConstants.COPYFILE_EXCL)
+    return { ok: true, path: 'assets/' + basename(file), name: basename(sourcePath) }
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+})
+
+// The app-global folder where images pasted into an UNSAVED doc are parked (we
+// don't know a document folder yet). Mirrors Typora's global image folder; on
+// the doc's first save they're moved into its ./assets (see image:inlineForSave).
+const pasteImagesDir = () => join(app.getPath('userData'), 'paste-images')
+
+// Save a pasted/dropped image next to the document, in an `assets/` subfolder,
+// and return the relative path to insert into the Markdown (Typora-style). This
+// is the no-image-host path for a SAVED doc; without it, pasted images become
+// in-memory blob: URLs that vanish on reload.
+ipcMain.handle('image:save', async (_e, docPath, name, bytes) => {
+  try {
+    if (!docPath) return { ok: false, error: 'No document path.' }
+    const dir = join(dirname(docPath), 'assets')
+    await fs.mkdir(dir, { recursive: true })
+    const file = uniqueImageFile(dir, name)
+    await fs.writeFile(file, Buffer.from(bytes))
+    // POSIX-relative link so it round-trips in Markdown on every OS.
+    return { ok: true, path: 'assets/' + basename(file) }
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+})
+
+// Save an image pasted into an UNSAVED doc to the global paste folder and return
+// a file:// URL — so it shows immediately as a real path (not a base64 blob),
+// like Typora. It's relocated into ./assets when the doc is first saved.
+ipcMain.handle('image:savePaste', async (_e, name, bytes) => {
+  try {
+    const dir = pasteImagesDir()
+    await fs.mkdir(dir, { recursive: true })
+    const file = uniqueImageFile(dir, name)
+    await fs.writeFile(file, Buffer.from(bytes))
+    return { ok: true, url: pathToFileURL(file).href }
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+})
+
+// At save time, rewrite a doc's Markdown so no image link is a giant base64 blob
+// or an absolute paste-folder path: base64 data URLs and file:// links in the
+// global paste folder are written/moved into the doc's ./assets and rewritten to
+// short relative paths (the Typora end-state). Other links are left untouched.
+ipcMain.handle('image:inlineForSave', async (_e, content, targetPath) => {
+  try {
+    if (!content || !targetPath) return { content, changed: false }
+    const matches = [...content.matchAll(/(!\[[^\]]*\]\()([^)\s]+)(\))/g)]
+    if (!matches.length) return { content, changed: false }
+    const assetsDir = join(dirname(targetPath), 'assets')
+    // Real path so the startsWith test below survives symlinks (e.g. macOS
+    // /tmp → /private/tmp), since the link's path and userData may differ.
+    let pdir = pasteImagesDir()
+    try {
+      pdir = realpathSync(pdir)
+    } catch {
+      /* folder not created yet — nothing to relocate from it */
+    }
+    let ensured = false
+    const ensure = async () => {
+      if (!ensured) {
+        await fs.mkdir(assetsDir, { recursive: true })
+        ensured = true
+      }
+    }
+    let out = ''
+    let cursor = 0
+    let changed = false
+    for (const m of matches) {
+      const [full, pre, url] = m
+      out += content.slice(cursor, m.index)
+      cursor = m.index + full.length
+      let replacement = full
+      try {
+        const dataM = url.match(/^data:image\/([a-zA-Z0-9.+-]+);base64,(.*)$/i)
+        if (dataM) {
+          await ensure()
+          const ext = dataM[1].toLowerCase() === 'jpeg' ? 'jpg' : dataM[1].toLowerCase().replace(/[^a-z0-9]/g, '') || 'png'
+          const file = uniqueImageFile(assetsDir, `image.${ext}`)
+          await fs.writeFile(file, Buffer.from(dataM[2], 'base64'))
+          replacement = pre + 'assets/' + basename(file) + ')'
+          changed = true
+        } else if (/^file:\/\//i.test(url)) {
+          const fsPath = fileURLToPath(url)
+          let realFsPath = fsPath
+          try {
+            realFsPath = realpathSync(fsPath)
+          } catch {
+            /* missing file — leave the link as-is */
+          }
+          if (realFsPath.startsWith(pdir) && existsSync(fsPath)) {
+            await ensure()
+            const file = uniqueImageFile(assetsDir, basename(fsPath))
+            await fs.copyFile(fsPath, file)
+            fs.rm(fsPath, { force: true }).catch(() => {})
+            replacement = pre + 'assets/' + basename(file) + ')'
+            changed = true
+          }
+        }
+      } catch {
+        /* keep the original link so the image is never lost */
+      }
+      out += replacement
+    }
+    out += content.slice(cursor)
+    return { content: out, changed }
+  } catch {
+    return { content, changed: false }
+  }
+})
+
+// ----------------------------- window controls -----------------------------
+// Custom min/max/close buttons (the native overlay is disabled so the renderer
+// can style their hover states). macOS keeps its native traffic lights.
+ipcMain.handle('window:minimize', () => mainWindow?.minimize())
+ipcMain.handle('window:toggleMaximize', () => {
+  if (!mainWindow) return false
+  if (mainWindow.isMaximized()) mainWindow.unmaximize()
+  else mainWindow.maximize()
+  return mainWindow.isMaximized()
+})
+ipcMain.handle('window:close', () => mainWindow?.close())
+ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
+// Settings › General. The preference itself is persisted by the renderer; main
+// only needs the live value.
+ipcMain.handle('window:setCloseToTray', (event, value) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return { ok: false }
+  closeToTray = value === true
+  if (closeToTray) createTray()
+  else destroyTray()
+  return { ok: true, closeToTray }
+})
+// Command palette ("Show / Hide Window"): the renderer can't hide/show its own
+// window, so it asks main — the same toggle the tray icon and global shortcut use.
+ipcMain.handle('window:toggleVisibility', (event) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return { ok: false }
+  toggleMainWindow()
+  return { ok: true }
+})
+// Custom keybindings › global commands. The renderer resolves the user's
+// effective binding and sends { commandId: electronAccelerator }; only the
+// whitelisted GLOBAL_COMMANDS are accepted. `unregistered` reports combinations
+// the OS/another app already owns so the settings UI can warn about them.
+ipcMain.handle('window:setGlobalShortcuts', (event, payload) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) {
+    return { ok: false, accelerators: {}, unregistered: [] }
+  }
+  return applyGlobalShortcuts(payload)
+})
+// This is intentionally a narrow bridge to Electron's existing View menu role.
+// DevTools remains desktop-only and renderer code never receives Node access.
+ipcMain.handle('window:toggleDevTools', (event) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+  mainWindow.webContents.toggleDevTools()
+  return true
+})
+
+// The renderer confirmed it's safe to close (no unsaved changes, or the user
+// chose to discard). A real quit quits the whole app; with close-to-tray on a
+// plain close only hides the window (and `allowClose` stays false so the next
+// close goes through the same confirm path again).
+ipcMain.on('app:confirm-close', () => {
+  if (isQuitting) {
+    allowClose = true
+    app.quit()
+    return
+  }
+  if (closeToTray) {
+    hideMainWindow()
+    return
+  }
+  allowClose = true
+  mainWindow?.close()
+})
+// The user cancelled the close. Clear the quit intent so a later window-close
+// (e.g. the macOS traffic light) isn't mistaken for a quit.
+ipcMain.on('app:cancel-close', () => {
+  isQuitting = false
+  updater.cancelPendingInstall()
+})
+
+// ----------------------------- update --------------------------------------
+// In-app update (#164): check, download (verified) and install on restart —
+// see updater.js. "Restart and install" quits through the tray-quit path, so
+// the renderer's unsaved-changes confirm still decides.
+const updater = registerUpdater({
+  app,
+  ipcMain,
+  net,
+  shell,
+  sendToRenderer: (channel, payload) => sendToRenderer(channel, payload),
+  requestQuit: () => quitApp(),
+  isOffline,
+  log: inputTraceEnabled
+    ? (entry) => {
+      const line = JSON.stringify({ pid: process.pid, t: Date.now(), ...entry }) + '\n'
+      inputTraceQueue = inputTraceQueue.catch(() => {}).then(() => fs.appendFile(inputTracePath(), line, 'utf8'))
+    }
+    : null
+})
+
+// Offline mode IPC. The main-process JSON file is authoritative; the renderer's
+// localStorage value is a mirror for immediate UI rendering.
+ipcMain.handle('offline:get', (event) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+  return isOffline()
+})
+ipcMain.handle('offline:set', (event, value) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) {
+    return { ok: false, offline: isOffline() }
+  }
+  const next = setOfflineMode(value)
+  if (next) {
+    // Stop work that may already be running; future requests are rejected and
+    // the session guard cancels renderer loads. closeAllConnections also drops
+    // sockets already opened by remote images/media/iframes.
+    for (const rootPath of syncService.status().running) syncService.control(rootPath, 'stop')
+    updater.cancelDownload()
+    session.defaultSession.closeAllConnections().catch(() => {})
+  }
+  sendToRenderer('offline:changed', next)
+  return { ok: true, offline: next }
+})
+
+ipcMain.handle('menu:setKeybindings', async (_event, accelerators) => {
+  const normalized = normalizeMenuKeybindingPayload(accelerators)
+  if (!normalized.ok) return normalized
+  menuKeybindings = normalized.keybindings
+  buildMenu()
+  return { ok: true, ignoredCommandIds: normalized.ignoredCommandIds }
+})
+
+ipcMain.handle('menu:getKeybindings', async () => ({ ...menuKeybindings }))
+
+ipcMain.handle('menu:getSnapshot', async () => getMenuSnapshot())
+
+// Menu actions are forwarded to renderer as commands.
+function menuCmd(cmd) {
+  return () => sendToRenderer('menu', cmd)
+}
+
+let menuKeybindings = {}
+
+function menuAccelerator(commandId) {
+  return menuAcceleratorFor(menuKeybindings, commandId, defaultMenuAcceleratorFor(commandId))
+}
+
+function serializeMenuItem(item) {
+  return {
+    label: item.label || '',
+    role: item.role || '',
+    type: item.type || '',
+    accelerator: item.accelerator || '',
+    submenu: item.submenu ? item.submenu.items.map(serializeMenuItem) : []
+  }
+}
+
+function getMenuSnapshot() {
+  const menu = Menu.getApplicationMenu()
+  return menu ? menu.items.map(serializeMenuItem) : []
+}
+
+function buildMenu() {
+  const isMac = process.platform === 'darwin'
+  const template = [
+    ...(isMac ? [{ role: 'appMenu' }] : []),
+    {
+      label: 'File',
+      submenu: [
+        { label: 'New File', accelerator: menuAccelerator('file.new'), click: menuCmd('new') },
+        { label: 'Open File…', accelerator: menuAccelerator('file.open'), click: menuCmd('open') },
+        { label: 'Open Folder…', accelerator: menuAccelerator('workspace.openFolder'), click: menuCmd('openFolder') },
+        { label: 'Attach File…', click: menuCmd('attachFile') },
+        { type: 'separator' },
+        { label: 'Save', accelerator: menuAccelerator('file.save'), click: menuCmd('save') },
+        { label: 'Save As…', accelerator: menuAccelerator('file.saveAs'), click: menuCmd('saveAs') },
+        { label: 'Export as PDF…', accelerator: menuAccelerator('file.exportPdf'), click: menuCmd('exportPdf') },
+        { label: 'Export as HTML…', accelerator: menuAccelerator('file.exportHtml'), click: menuCmd('exportHtml') },
+        {
+          label: 'Export via Pandoc',
+          submenu: [
+            { label: 'Word (.docx)…', accelerator: menuAccelerator('file.exportPandocDocx'), click: menuCmd('exportPandocDocx') },
+            { label: 'EPUB (.epub)…', accelerator: menuAccelerator('file.exportPandocEpub'), click: menuCmd('exportPandocEpub') },
+            { label: 'LaTeX (.tex)…', accelerator: menuAccelerator('file.exportPandocLatex'), click: menuCmd('exportPandocLatex') },
+            { label: 'OpenDocument (.odt)…', accelerator: menuAccelerator('file.exportPandocOdt'), click: menuCmd('exportPandocOdt') },
+            { label: 'Rich Text (.rtf)…', accelerator: menuAccelerator('file.exportPandocRtf'), click: menuCmd('exportPandocRtf') },
+            { label: 'MediaWiki (.wiki)…', accelerator: menuAccelerator('file.exportPandocMediawiki'), click: menuCmd('exportPandocMediawiki') },
+            { label: 'Plain Text (.txt)…', accelerator: menuAccelerator('file.exportPandocTxt'), click: menuCmd('exportPandocTxt') }
+          ]
+        },
+        { type: 'separator' },
+        { label: 'Close Tab', accelerator: menuAccelerator('tab.close'), click: menuCmd('closeTab') },
+        // macOS: give "Close Window" Shift+Cmd+W so it doesn't fight Close Tab
+        // for Cmd+W (role 'close' otherwise defaults to Cmd+W). Windows: Quit.
+        isMac ? { role: 'close', accelerator: 'Shift+CmdOrCtrl+W' } : { role: 'quit' }
+      ]
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'selectAll' },
+        { type: 'separator' },
+        { label: 'Find', accelerator: menuAccelerator('editor.find'), click: menuCmd('find') }
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [
+        { label: 'Command Palette', accelerator: menuAccelerator('view.commandPalette'), click: menuCmd('palette') },
+        // Sidebar toggle is handled in the renderer as Ctrl/Cmd+Shift+B. Plain
+        // Ctrl/Cmd+B remains the editor's standard bold shortcut (#67).
+        { label: 'Toggle Sidebar', click: menuCmd('toggleSidebar') },
+        { label: 'Full Screen Mode', click: menuCmd('toggleImmersive') },
+        { label: 'Toggle Outline', accelerator: menuAccelerator('view.showOutline'), click: menuCmd('toggleOutline') },
+        { label: 'Global Search', accelerator: menuAccelerator('view.globalSearch'), click: menuCmd('globalSearch') },
+        { label: 'Toggle Source Mode', accelerator: menuAccelerator('view.toggleSource'), click: menuCmd('toggleSource') },
+        { type: 'separator' },
+        { label: 'Toggle Theme', accelerator: menuAccelerator('view.cycleTheme'), click: menuCmd('toggleTheme') },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+        { role: 'toggleDevTools' }
+      ]
+    },
+    // Windows/Linux: the bare 'windowMenu' role injects { role:'close' } whose
+    // DEFAULT accelerator is CmdOrCtrl+W — which collides with Close Tab (#30),
+    // sometimes closing the whole window/app instead of the tab. Use a custom
+    // submenu so Close binds Alt+F4 (the Windows standard), leaving Ctrl+W for
+    // Close Tab. macOS keeps the bare role (its windowMenu has no 'close').
+    isMac
+      ? { role: 'windowMenu' }
+      : {
+          label: 'Window',
+          submenu: [
+            { role: 'minimize' },
+            { role: 'zoom' },
+            { type: 'separator' },
+            { role: 'close', accelerator: 'Alt+F4' }
+          ]
+        }
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}

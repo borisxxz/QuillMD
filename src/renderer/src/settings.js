@@ -1,0 +1,442 @@
+// User preferences persisted to localStorage, separate from the session state
+// (open tabs, workspace…) in paths.js. Currently holds the editor page width and
+// the image-host upload command. Kept small and self-contained so the Settings
+// modal and App can share one source of truth.
+
+export const SETTINGS_KEY = 'horsemd.settings.v1'
+
+// Page-width slider bounds (px). 'full' (a preset, not a slider value) fills the
+// pane instead.
+export const PAGE_WIDTH_MIN = 600
+export const PAGE_WIDTH_MAX = 1400
+export const DEFAULT_PAGE_WIDTH = 800
+
+// Quick presets shown as chips above the slider. 'full' = fill the editor pane.
+export const PAGE_WIDTH_PRESETS = [
+  { id: 'narrow', width: 700 },
+  { id: 'medium', width: 800 },
+  { id: 'wide', width: 1000 },
+  { id: 'full', width: 'full' }
+]
+
+// Auto-save inactivity delays offered in Settings › Files (seconds; 0 = off).
+export const AUTO_SAVE_DELAYS = [0, 3, 10, 60]
+
+// Automatic cloud sync: the fallback check interval offered in Settings ›
+// Sync (minutes). Saves, start-up and window focus trigger syncs on their own.
+export const SYNC_AUTO_MINUTES = [5, 15, 30, 60]
+export const DEFAULT_SYNC_AUTO_MINUTES = 5
+// Auto-save delay used while automatic sync is on and the user's own is off.
+export const SYNC_AUTO_SAVE_DELAY = 3
+
+// How long local version history is kept (days), Settings › Files.
+export const HISTORY_RETENTION_DAYS = [30, 90, 365]
+export const DEFAULT_HISTORY_RETENTION_DAYS = 30
+
+// Outline tiers expanded when a document is first shown (#122; 0 = all).
+export const OUTLINE_DEFAULT_LEVELS = [1, 2, 3, 4, 0]
+export const DEFAULT_OUTLINE_LEVEL = 2
+
+// Editor body font size (px). Applies only to the document content, not the app
+// chrome (tabs / sidebar / status bar).
+export const FONT_SIZE_MIN = 12
+export const FONT_SIZE_MAX = 24
+export const DEFAULT_FONT_SIZE = 16
+
+// Quick presets shown as a segmented control above the fine-tune slider.
+export const FONT_SIZE_PRESETS = [
+  { id: 'small', size: 14 },
+  { id: 'medium', size: 16 },
+  { id: 'large', size: 18 },
+  { id: 'xlarge', size: 20 }
+]
+
+// Source-mode font size OFFSET (px) relative to the editor body font size
+// (issue #78). Source mode shows raw Markdown in a monospace textarea; its size
+// tracks the rich editor font. Default 0 = the SAME size as the document body
+// (there's no reason source should differ). The offset is kept as an optional
+// knob: a low-vision reader can push source larger, or someone can shrink it to
+// fit more raw Markdown on screen.
+export const SOURCE_FONT_OFFSET_MIN = -4
+export const SOURCE_FONT_OFFSET_MAX = 8
+export const DEFAULT_SOURCE_FONT_OFFSET = 0
+
+// Editor body line-height (unitless). Default matches the built-in stylesheet.
+export const LINE_HEIGHT_MIN = 1.4
+export const LINE_HEIGHT_MAX = 2.4
+export const DEFAULT_LINE_HEIGHT = 1.85
+export const LINE_HEIGHT_PRESETS = [
+  { id: 'compact', value: 1.6 },
+  { id: 'standard', value: 1.85 },
+  { id: 'relaxed', value: 2.0 },
+  { id: 'loose', value: 2.2 }
+]
+
+// Space between paragraphs (em). 0 = paragraphs sit flush.
+export const PARA_SPACING_MIN = 0
+export const PARA_SPACING_MAX = 2
+export const DEFAULT_PARA_SPACING = 0.8
+export const PARA_SPACING_PRESETS = [
+  { id: 'tight', value: 0.4 },
+  { id: 'standard', value: 0.8 },
+  { id: 'relaxed', value: 1.2 },
+  { id: 'loose', value: 1.6 }
+]
+
+// Space before headings (em). The stylesheet derives the smaller after-heading
+// gap from this value so one control changes density without flattening the
+// visual hierarchy.
+export const HEADING_SPACING_MIN = 0.6
+export const HEADING_SPACING_MAX = 2.4
+export const DEFAULT_HEADING_SPACING = 1.8
+export const HEADING_SPACING_PRESETS = [
+  { id: 'tight', value: 0.8 },
+  { id: 'compact', value: 1.2 },
+  { id: 'standard', value: 1.8 },
+  { id: 'loose', value: 2.2 }
+]
+
+const round1 = (n) => Math.round(n * 10) / 10
+
+// Default font stacks (app.css defines the same names on body.light/dark). A
+// user-set font (issue #38) is PREPENDED to these so an unknown glyph still
+// falls back gracefully.
+export const DEFAULT_FONT_WRITE =
+  "'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Hiragino Sans GB', 'Source Han Sans SC', 'Noto Sans SC', 'Microsoft YaHei', sans-serif"
+// Latin part of DEFAULT_FONT_WRITE: what letters use when only the Chinese
+// font is customised.
+export const DEFAULT_FONT_LATIN = "'Helvetica Neue', Helvetica, Arial"
+export const DEFAULT_FONT_MONO =
+  "'JetBrains Mono', ui-monospace, 'SFMono-Regular', Consolas, 'Courier New', monospace"
+
+// CSS snippets follow Obsidian's useful model: several small, named overrides
+// can be enabled independently and compose in list order. Keep the old string
+// key below for backwards compatibility with versions that predate snippets.
+export const DEFAULT_USER_CSS_SNIPPETS = [
+  { id: 'default', name: '', enabled: true, css: '' }
+]
+
+export function normalizeUserCssSnippets(raw, legacyCss = '') {
+  const usedIds = new Set()
+  const snippets = Array.isArray(raw)
+    ? raw.slice(0, 40).reduce((items, value, index) => {
+      if (!value || typeof value !== 'object' || typeof value.css !== 'string') return items
+      let id = typeof value.id === 'string' ? value.id.trim().slice(0, 80) : ''
+      if (!id || usedIds.has(id)) id = `snippet-${index + 1}`
+      usedIds.add(id)
+      items.push({
+        id,
+        name: typeof value.name === 'string' ? value.name.trim().slice(0, 80) : '',
+        enabled: value.enabled !== false,
+        css: value.css
+      })
+      return items
+    }, [])
+    : []
+
+  if (snippets.length) return snippets
+  if (typeof legacyCss === 'string' && legacyCss) {
+    return [{ id: 'legacy', name: '', enabled: true, css: legacyCss }]
+  }
+  return DEFAULT_USER_CSS_SNIPPETS.map((snippet) => ({ ...snippet }))
+}
+
+// Build a font-family stack with the user's font first (quoted — names can have
+// spaces, e.g. "Fira Code Nerd Font"). Empty name → null (don't override the
+// default stack, and on Windows let the .app.is-win Consolas rule still apply).
+export const fontStack = (name, base) => {
+  const n = (name || '').trim().replace(/'/g, '')
+  return n ? `'${n}', ${base}` : null
+}
+
+// Document font with separate English and Chinese fonts: English first, so
+// letters, digits and Latin punctuation use it, while CJK characters (which
+// an English font does not contain) fall through to the Chinese font. An
+// unset English font keeps the default Latin fonts in front, so the Chinese
+// font's own Latin glyphs are not used unless chosen as the English font too.
+export const writeFontStack = (latin, cjk) => {
+  const clean = (name) => (name || '').trim().replace(/'/g, '')
+  const l = clean(latin)
+  const c = clean(cjk)
+  if (!l && !c) return null
+  return [l ? `'${l}'` : DEFAULT_FONT_LATIN, c ? `'${c}'` : null, DEFAULT_FONT_WRITE]
+    .filter(Boolean)
+    .join(', ')
+}
+
+export const DEFAULT_SETTINGS = {
+  // Manual keeps the selected built-in/imported theme unchanged. System chooses
+  // one of the saved built-in day/night themes when the OS appearance changes.
+  themeMode: 'manual',
+  systemLightTheme: 'light',
+  systemDarkTheme: 'dark',
+  pageWidth: DEFAULT_PAGE_WIDTH,
+  fontSize: DEFAULT_FONT_SIZE,
+  // Source-mode font size offset relative to fontSize (issue #78).
+  sourceFontOffset: DEFAULT_SOURCE_FONT_OFFSET,
+  lineHeight: DEFAULT_LINE_HEIGHT,
+  paragraphSpacing: DEFAULT_PARA_SPACING,
+  headingSpacing: DEFAULT_HEADING_SPACING,
+  // Document (writing) + code font overrides (issue #38). Empty = use the
+  // default stack; otherwise the name leads the stack (e.g. a Nerd Font).
+  // Document fonts: `fontWrite` is the Chinese (CJK) font, `fontWriteLatin`
+  // the English one. Before they were split, `fontWrite` applied to all
+  // text; such settings load with fontWriteLatin = fontWrite (same look).
+  fontWrite: '',
+  fontWriteLatin: '',
+  fontMono: '',
+  // Empty = no image host: pasted/uploaded images keep the default behavior
+  // (a local object URL). When set, it's run like Typora's "custom command":
+  // the image file path is appended as an argument and the command prints the
+  // resulting URL to stdout.
+  imageUploadCommand: '',
+  // English spell-check (red wavy underline) in the rich editor. Default OFF
+  // (cleaner for Chinese-first writing). Editor.jsx applies it as the `spellcheck`
+  // attribute on the Crepe `.ProseMirror` contenteditable; other surfaces (the
+  // source textarea, inputs) always opt out via spellCheck={false}.
+  spellcheck: false,
+  // Typora's subscript `H~2~O` / superscript `x^2^` syntax. Off by default
+  // like Typora: Chinese prose uses `~` for ranges (`1~2天，100~200元`).
+  // Read when an editor is created (applies to documents opened afterwards).
+  markdownSubscript: false,
+  markdownSuperscript: false,
+  // Last-chosen PDF export density preset (comfort/standard/compact). Persisted
+  // so the user's "compact format" choice survives across exports.
+  lastPdfDensityPreset: 'standard',
+  // Inline LaTeX deletion mode. "protect" prevents accidental whole-formula
+  // deletion by selecting the formula on the first Backspace/Delete and only
+  // deleting it on the second press. "fast" keeps the previous one-key delete.
+  inlineMathDeleteMode: 'protect',
+  // Desktop rich editor: leave the compact selection toolbar on by default.
+  // Users who prefer an uninterrupted writing surface can use the expanded
+  // right-click formatting menu instead.
+  selectionToolbar: true,
+  // Keep ordinary source newlines visible in rich mode without changing their
+  // Markdown meaning or serializing them as explicit hard breaks.
+  preserveSoftBreaks: true,
+  // Reopen saved files and unsaved scratch tabs from the previous session.
+  // Disabling this affects startup only; files explicitly passed by the OS or
+  // command line still open normally.
+  restoreSession: true,
+  // Auto-save (#136): seconds of editing inactivity before a dirty, already
+  // saved-to-disk document is written in place (also flushed when the window
+  // loses focus). 0 = off. Untitled tabs, external-change conflicts and
+  // unmappable rich edits are never auto-saved — see hooks/useAutoSave.js.
+  autoSaveDelay: 0,
+  // Automatic sync (无感同步) of every folder bound to a cloud connection:
+  // after saves, at start-up, on window focus, and every `syncAutoMinutes`
+  // as a fallback — see hooks/useAutoSync.js. While on, auto-save is at
+  // least SYNC_AUTO_SAVE_DELAY seconds (App.jsx).
+  syncAuto: true,
+  syncAutoMinutes: DEFAULT_SYNC_AUTO_MINUTES,
+  // Local version history (main/history): days a version is kept. Pinned
+  // versions never expire.
+  historyRetentionDays: DEFAULT_HISTORY_RETENTION_DAYS,
+  // Outline default expansion (#122): how many heading tiers the outline shows
+  // for a document seen for the first time this session. 0 = everything.
+  outlineDefaultLevel: DEFAULT_OUTLINE_LEVEL,
+  // Desktop: closing the window hides it to the system tray instead of quitting,
+  // so the app keeps running in the background (tray icon / Alt+M restore it).
+  // Default off — "close quits" stays the long-standing behavior; the tray is
+  // opt-in from Settings › General.
+  closeToTray: false,
+  // Show dotfiles/dotdirs (.claude, .cursor, .github, etc.) in the file tree.
+  // Default off. .git/node_modules/out/dist are always hidden (IGNORED_DIRS).
+  showHiddenFiles: false,
+  // Legacy single CSS snippet. Retained so users can safely move between
+  // versions; new UI writes userCssSnippets instead.
+  userCss: '',
+  userCssSnippets: DEFAULT_USER_CSS_SNIPPETS,
+  // Mobile-only reading lock. Desktop intentionally never consumes this value.
+  mobileReadOnly: false,
+  // Desktop reading mode (#163): every document is shown read-only (select,
+  // copy, find, outline, export still work). Kept apart from mobileReadOnly so
+  // the two platforms never inherit each other's lock.
+  readingMode: false,
+  // Wide tables scroll by default. Readers who prefer a print-like layout can
+  // opt into wrapping every column into the current writing width instead.
+  tableAutoWrap: false,
+  // Strict offline mode. Main also persists this in userData/offline-mode.json
+  // so startup update checks / automatic sync know it before the renderer mounts.
+  offlineMode: false
+}
+
+function normalizeWidth(w) {
+  if (w === 'full') return 'full'
+  const n = Number(w)
+  if (!Number.isFinite(n)) return DEFAULT_PAGE_WIDTH
+  return Math.min(PAGE_WIDTH_MAX, Math.max(PAGE_WIDTH_MIN, Math.round(n)))
+}
+
+function normalizeThemeId(value, fallback) {
+  return typeof value === 'string' && ['light', 'dark', 'morandi', 'morandi-rose', 'morandi-blue', 'morandi-dark'].includes(value)
+    ? value
+    : fallback
+}
+
+function normalizeFontSize(s) {
+  const n = Number(s)
+  if (!Number.isFinite(n)) return DEFAULT_FONT_SIZE
+  return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, Math.round(n)))
+}
+
+function normalizeSourceFontOffset(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return DEFAULT_SOURCE_FONT_OFFSET
+  return Math.min(SOURCE_FONT_OFFSET_MAX, Math.max(SOURCE_FONT_OFFSET_MIN, Math.round(n)))
+}
+
+function normalizeInRange(v, min, max, def) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return def
+  return Math.min(max, Math.max(min, round1(n)))
+}
+
+export function loadSettings() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')
+    return {
+      themeMode: raw.themeMode === 'system' ? 'system' : 'manual',
+      systemLightTheme: normalizeThemeId(raw.systemLightTheme, 'light'),
+      systemDarkTheme: normalizeThemeId(raw.systemDarkTheme, 'dark'),
+      pageWidth: normalizeWidth(raw.pageWidth ?? DEFAULT_PAGE_WIDTH),
+      fontSize: normalizeFontSize(raw.fontSize ?? DEFAULT_FONT_SIZE),
+      sourceFontOffset: normalizeSourceFontOffset(raw.sourceFontOffset),
+      lineHeight: normalizeInRange(raw.lineHeight, LINE_HEIGHT_MIN, LINE_HEIGHT_MAX, DEFAULT_LINE_HEIGHT),
+      paragraphSpacing: normalizeInRange(
+        raw.paragraphSpacing,
+        PARA_SPACING_MIN,
+        PARA_SPACING_MAX,
+        DEFAULT_PARA_SPACING
+      ),
+      headingSpacing: normalizeInRange(
+        raw.headingSpacing,
+        HEADING_SPACING_MIN,
+        HEADING_SPACING_MAX,
+        DEFAULT_HEADING_SPACING
+      ),
+      imageUploadCommand:
+        typeof raw.imageUploadCommand === 'string' ? raw.imageUploadCommand : '',
+      spellcheck: raw.spellcheck === true,
+      markdownSubscript: raw.markdownSubscript === true,
+      markdownSuperscript: raw.markdownSuperscript === true,
+      inlineMathDeleteMode: raw.inlineMathDeleteMode === 'fast' ? 'fast' : 'protect',
+      selectionToolbar: raw.selectionToolbar !== false,
+      preserveSoftBreaks: raw.preserveSoftBreaks !== false,
+      restoreSession: raw.restoreSession !== false,
+      autoSaveDelay: AUTO_SAVE_DELAYS.includes(raw.autoSaveDelay) ? raw.autoSaveDelay : 0,
+      syncAuto: raw.syncAuto !== false,
+      // 0 was "off" before syncAuto existed → the default interval.
+      syncAutoMinutes: SYNC_AUTO_MINUTES.includes(raw.syncAutoMinutes) ? raw.syncAutoMinutes : DEFAULT_SYNC_AUTO_MINUTES,
+      historyRetentionDays: HISTORY_RETENTION_DAYS.includes(raw.historyRetentionDays)
+        ? raw.historyRetentionDays
+        : DEFAULT_HISTORY_RETENTION_DAYS,
+      outlineDefaultLevel: OUTLINE_DEFAULT_LEVELS.includes(raw.outlineDefaultLevel)
+        ? raw.outlineDefaultLevel
+        : DEFAULT_OUTLINE_LEVEL,
+      closeToTray: raw.closeToTray === true,
+      showHiddenFiles: raw.showHiddenFiles === true,
+      fontWrite: typeof raw.fontWrite === 'string' ? raw.fontWrite : '',
+      fontWriteLatin: typeof raw.fontWriteLatin === 'string'
+        ? raw.fontWriteLatin
+        : typeof raw.fontWrite === 'string' ? raw.fontWrite : '',
+      fontMono: typeof raw.fontMono === 'string' ? raw.fontMono : '',
+      userCss: typeof raw.userCss === 'string' ? raw.userCss : '',
+      userCssSnippets: normalizeUserCssSnippets(raw.userCssSnippets, raw.userCss),
+      mobileReadOnly: raw.mobileReadOnly === true,
+      readingMode: raw.readingMode === true,
+      tableAutoWrap: raw.tableAutoWrap === true,
+      offlineMode: raw.offlineMode === true,
+      lastPdfDensityPreset: ['comfort', 'standard', 'compact'].includes(raw.lastPdfDensityPreset)
+        ? raw.lastPdfDensityPreset
+        : 'standard'
+    }
+  } catch {
+    return { ...DEFAULT_SETTINGS }
+  }
+}
+
+export function saveSettings(s) {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s))
+  } catch {
+    /* quota / serialization failure — skip */
+  }
+}
+
+// Apply the page width to the document. The width is a CSS variable read by the
+// editor column; the full-width case needs a body class because the source
+// editor centers via a calc() that can't collapse to "no max-width" through the
+// variable alone.
+export function applyPageWidth(width) {
+  const root = document.documentElement
+  if (width === 'full') {
+    document.body.classList.add('hm-full-width')
+  } else {
+    document.body.classList.remove('hm-full-width')
+    root.style.setProperty('--editor-max-width', (width || DEFAULT_PAGE_WIDTH) + 'px')
+  }
+}
+
+// Apply the editor body font size as a CSS variable the content column reads.
+// Headings, code, etc. scale relative to this via `em`, so the whole document
+// grows/shrinks together; the app chrome keeps its own fixed sizes.
+export function applyFontSize(size) {
+  document.documentElement.style.setProperty(
+    '--editor-font-size',
+    normalizeFontSize(size) + 'px'
+  )
+}
+
+// Apply the source-mode font offset (issue #78). `.source-editor` computes its
+// font size as calc(--editor-font-size + --source-font-offset), so the source
+// font tracks the body font but can be independently nudged.
+export function applySourceFontOffset(offset) {
+  document.documentElement.style.setProperty(
+    '--source-font-offset',
+    normalizeSourceFontOffset(offset) + 'px'
+  )
+}
+
+// Body line-height (unitless) and paragraph top/bottom spacing (em), exposed as
+// CSS variables the editor content reads.
+export function applyLineHeight(value) {
+  document.documentElement.style.setProperty(
+    '--editor-line-height',
+    String(normalizeInRange(value, LINE_HEIGHT_MIN, LINE_HEIGHT_MAX, DEFAULT_LINE_HEIGHT))
+  )
+}
+
+export function applyParagraphSpacing(value) {
+  document.documentElement.style.setProperty(
+    '--editor-para-spacing',
+    normalizeInRange(value, PARA_SPACING_MIN, PARA_SPACING_MAX, DEFAULT_PARA_SPACING) + 'em'
+  )
+}
+
+export function applyHeadingSpacing(value) {
+  document.documentElement.style.setProperty(
+    '--editor-heading-spacing',
+    normalizeInRange(
+      value,
+      HEADING_SPACING_MIN,
+      HEADING_SPACING_MAX,
+      DEFAULT_HEADING_SPACING
+    ) + 'em'
+  )
+}
+
+// Keep the alternate wide-table layout scoped to a body class. This preserves
+// the normal per-table scrolling and column-resize behavior until a user opts
+// into fitting every column into the writing area.
+export function applyTableAutoWrap(enabled) {
+  document.body.classList.toggle('hm-table-auto-wrap', enabled === true)
+}
+
+// Milkdown preserves an ordinary Markdown newline as an inline hardbreak node
+// whose DOM contains a space. This class changes only that node's visual
+// presentation; parsing, serialization, source offsets, and explicit <br>
+// hardbreaks remain untouched.
+export function applySoftBreakDisplay(enabled) {
+  document.body.classList.toggle('hm-preserve-soft-breaks', enabled !== false)
+}

@@ -1,0 +1,461 @@
+# 大文档打开卡顿：根因分析与优化方案
+
+## 2026-10-24 存档：切换标签、打字、加粗、改标题层级（面试题文档，Windows）
+
+用户反馈（Windows）：从别的文档切到大文档、输入和删除、改标题层级/加粗/斜体都明显卡顿，「只是鼠标点起来流畅一些」。测试文件：用户的面试题笔记，约 25.7 万字符、2941 行、1227 个 `<font>`、294 个标题，1337 个顶层块；**不在仓库里**。
+
+上一轮的测试只量了「打字停下后的最长任务」，没有量切换标签、单键延迟和格式快捷键。新测速脚本 `scripts/perf/bench-heavy-ops.mjs` 覆盖这几项：每个操作从输入事件到两帧之后（≈ 上屏），加随后 1 秒内的长任务，并检查操作真的生效（打出的字、H2、光标所在块）。`PROFILE=1` 存 CPU profile，`TIMELINE=1` 记录原生样式/布局时间和触发它的 JS，`BENCH_SCROLL=1` 量滚轮滚动的帧间隔。
+
+### 结果（Windows i5-12600KF，不开 trace，两轮）
+
+| | 0.13.255 | 本轮 |
+|---|---|---|
+| 切到大文档的长任务 | 387–422 ms | 188–246 ms |
+| 打字：上屏 p50 / 停顿后长任务 | 26–29 / 155–166 ms | 25–26 / 141–142 ms |
+| 退格停顿后长任务 | 122–123 ms | 0（无 >50 ms 任务）|
+| 加粗、斜体后的长任务 | 110–128 ms | 0 |
+| 改标题层级：上屏 / 长任务 | 336–337 / 265–276 ms | 180–185 / 119–223 ms |
+| 滚动：>33 ms 的帧（约 800 帧中）| 2–5 | 3–4 |
+
+### 做了什么
+
+1. **切换标签时保存光标位置不再整篇解析。** `useDocPositions` 在每次切换时为所有标签算光标对应的 Markdown 位置，每次都把整篇 Markdown 重新解析一遍（mini ~120 ms）。现在：解析出的块列表按 Markdown 字符串缓存、PM 块列表按文档缓存（`editor-source-map.js`）；只保存离开的那个标签；放到空闲时执行。
+2. **标题 id 事务不再触发整篇序列化。** Milkdown 的标题 id 插件在每次改标题后再派发一个只改 `id` 的事务；标题序列化只写 `level`，所以这份文档和前一份序列化结果相同。序列化缓存遇到「只差标题 id」的文档（`sameIgnoringHeadingIds`）直接复用。
+3. **增量序列化**（`lib/incremental-serialize.js`，见 CLAUDE.md）：只重新序列化改动所在的块。Windows 上整篇序列化这份文档约 90 ms，打字停顿、退格、加粗、斜体、改标题每次至少一次。差分测试：夹具 + 真实文档，随机编辑 2656 次比较，与整篇序列化逐字节相同（自检构建同时逐次核对）。自检构建下全套回归（5 个会话 + 74 个独立测试，除已知段落测试）通过；fuzz 默认夹具 31–36 无事，语雀样本 41–48 与 10-23 存档一致（41、48 暂停，均 fail-closed）。
+   - fuzz 判据修正：语雀样本 42、48 在 0.13.255 与本轮都报「损坏」，实为判据不对称——`<font>` 末尾的空格保存后移到两个 `<font>` 之间，可见文字相同，只差这几个空格是否带颜色。判据现在把「挨着另一个 run 的边缘空格」拆成普通空格再比较。
+4. **状态栏字数统计**放到空闲时，并按标签缓存（切回没改过的标签不再在点击里重算）。
+5. **表格控件定位**（`editor-dom-layout.js` 的 `fix`）每次 DOM 变化和选区变化都在全文查询表格并强制布局；没有表格时直接返回，有表格时只在表格内查询，列宽同步只在表格相关的变化后做。
+
+### 试过、没有用的
+
+- **降低 content-visibility 门槛**（这份文档 1003 块，低于 1200）：mac 上切换从 ~115 降到 ~28 ms，但 Windows 上只到 ~160–186 ms，而且滚动变差（>33 ms 帧 7–10，最长 55–61 ms），和 0.7.2 当年调高门槛的原因一致。不改。
+- **隐藏的标签保持布局**（`content-visibility: hidden` 代替 `display: none`）：mac ~25 ms，Windows 仍 ~160–190 ms；且 285 个测试用 `offsetParent` 找「当前可见的编辑器」，改动面太大。不改。
+- **去掉 `:has()` 选择器**（`hm-cv` 规则和 Windows 段落 `contain: paint` 规则）：两处都量过，没有可测的差别。一开始在 mac 上看到的 70 ms 是测法错误：测速脚本每 100 ms 重新加 `hm-cv` 类，而 React 每次切换会去掉它，重加类会让整篇文档重算样式。
+
+### 剩下的（Windows）
+
+- 切换标签剩下的约 200 ms 是新显示的文档整篇重算样式（~105 ms）和布局（~57 ms），由 `Tabs.jsx` 的 `scrollIntoView` 强制同步执行；去掉它只会挪到下一帧。要再降需要让隐藏的标签保留渲染状态（见上，测试改动大）。
+- 打字停顿后的长任务约 140 ms：同步管线（重印 + 校验，约 76 ms）、内容提交后的 React 重渲染（约 49 ms）等在同一个任务里。
+- 改标题层级上屏约 190 ms：大部分是原生样式/布局/绘制，以及改标题时立即执行的重印和校验。
+
+## 2026-10-23 存档：富文本大文档编辑卡顿（语雀导出，两轮优化）
+
+用户反馈：在一份约 35 万字符的语雀导出文件里，段落中间打字、点击、选中都很慢，Windows 上更明显。这份文件几乎每行都包在 `<font style=…>` 里，共 2900 多个标签；ProseMirror 内容大小约 9.3 万。
+
+用户的要求：
+- 不放宽富文本/源码一致性校验；
+- Windows 和 Mac 都要测；
+- 要和 Obsidian 对比。
+
+测试用的是用户的真实文件，**不在仓库里**；脚本通过参数指定文件。
+
+### 结果
+
+同一文件，不开 trace，各跑 2–3 轮。
+
+Windows（i5-12600KF）：
+
+| | 0.13.252 | 第一轮（1ae804f） | 第二轮 | Obsidian 1.14 |
+|---|---|---|---|---|
+| 打字停下后的最长任务 | ~805 ms | ~640 ms | **~126 ms** | 0 |
+| 点击（pointerdown→2 帧） | ~10 ms | ~11 ms | ~10 ms | ~9 ms |
+| 拖选 6 步 | ~900 ms | ~290 ms | ~310 ms | ~100 ms |
+| 打开后第一次点击 | ~320 ms | ~250 ms | ~260 ms | ~11 ms |
+| `<font>` 内部分选中 | 否（整块原子） | 是 | 是 | 是 |
+
+Mac mini（M 系列）：
+
+| | 0.13.252 | 第一轮（1ae804f） | 第二轮 | Obsidian 1.14 |
+|---|---|---|---|---|
+| 打字停下后的最长任务 | ~500 ms | ~420 ms | **~100 ms** | 0 |
+| 点击 | ~20 ms | — | ~13 ms | ~30 ms |
+| 拖选 | ~560 ms | — | ~250 ms | ~230 ms |
+
+### 第一轮（commit 1ae804f）
+
+- **只点击、不修改时，不再整篇同步。**
+  - `isLiveDocCommitted` 判断当前文档就是已验证过的那份：Coordinator 快照，或上一次通过的基线检查，按文档身份或 `Node.eq` 比较。
+  - `pointerdown` 调用的 `markUserEdit` 不带块键。
+- **解析缓存从未命中。** unified 处理器是 `typeof 'function'`，但 `cacheKey` 只认 `'object'`。
+- **序列化结果按文档缓存。**
+  - `serializerCtx` 外面包一层 WeakMap。
+  - 同步改为监听 Milkdown 的 `updated`，不再监听 `markdownUpdated`。后者每次 200 ms 停顿都会整篇序列化一次，即使同步本身被推迟。
+- **「未保存」对账定时器不再抢跑整篇同步。** 同步待处理时它会等待（`isMarkdownSyncPending`，最长 3 s）。Windows 上它原来占了 11 s 里的 4 s。
+- **去掉一条 `p:has(> .hm-html-block) > br…` 规则。** 任一子元素的 class 变化，Chromium 都会重算所有匹配元素，每次点击要做 5 万次样式重算。
+
+### 第二轮：增量解析 + 逐块比对缓存
+
+原来每次停顿的同步要做四件整篇的事，mini 稳态共 ~300 ms：
+
+| 步骤 | 耗时 |
+|---|---|
+| 解析候选源码 | ~170 ms |
+| 序列化 | ~50 ms |
+| 两次文档比对 | ~50 + ~24 ms |
+| 列表槽比对 | ~6 ms |
+
+这一轮做了四件事：
+
+1. **增量解析**（`src/renderer/src/lib/source-reprint/incremental-parse.js`）
+   - **做法**：重印基底（已提交的源码）和校验用的候选源码，都从缓存里相邻的解析结果出发（每个编辑器缓存 3 条），只重新解析改动所在的顶层块窗口。
+     - 窗口外的 mdast 直接复用：位置做平移；窗口后面的部分复制一份再改，不动原对象。
+     - ProseMirror 节点直接复用。
+   - **为什么结果和整篇解析一样**：窗口只在 micromark 状态为空的地方切。
+     - 起点：「真正的段落 + 空行」、标题或分隔线之后。
+     - 终点：窗口**自己的**解析结果必须以同类的闭合块结尾。如果改动打开了未闭合的围栏、`$$` 或 HTML 块，最后一块会变成代码或 HTML，这时退回整篇解析。
+   - **以下情况始终整篇解析**：
+     - 文本含 `]:`：链接/脚注定义是全局的，而且 remark-inline-links 会把定义节点从树里删掉，结果里查不到；
+     - 文件以 `---` 或 `+++` 开头：未闭合的 frontmatter 会让**之后所有**列表和引用变成段落。这是 micromark 扩展的行为，由差分测试抓到；
+     - 窗口以 `---` 开头；
+     - 带 BOM；
+     - 窗口超过全文一半。
+2. **逐块比对缓存**（`areSourceDocumentsEquivalent`，在 `lib/source-transaction-sync.js`）
+   - 每个顶层节点的 semanticJson 用节点做键缓存在 WeakMap 里。
+   - 文档级的三步处理在缓存单元上重放：去掉空的顶层段落/标题、统一单张图片、合并相邻的同类列表。
+   - 只有判定「相同」时才走快路径。判定不同，或选项里带路径或未知的键时，走原来的整篇比较，失败时的记录不变。
+3. **打开后预热**
+   - 适用于大文档：内容 > 5 万，或源码 > 15 万字符。
+   - 编辑器就绪 1 s 后，在空闲时先做一次解析和比对，约 190 ms 的开销挪到空闲时间，第一次编辑不再付整篇成本。
+   - 如果已经开始编辑，就跳过预热。
+4. **修正大文档判定**
+   - 语雀导出大部分是标签字节：35 万字符只有约 9.3 万内容，原来按 10 万判定会漏掉。
+   - 现在改用 `isLargeSyncDocument`（阈值同第 3 条），打字过程中继续推迟同步。
+
+效果：mini 稳态每次停顿从 ~300 ms 降到 ~75 ms，其中序列化约 50 ms；重印加校验从 ~235 ms 降到 ~21 ms。
+
+### 安全措施（必须保留）
+
+- **差分测试 `npm run test:incremental-parse-ui`**（已登记进回归）
+  - 在真实编辑器的 remark 管线里，对多份文档做带种子的随机 Markdown 编辑，覆盖围栏、`$$`、HTML 块、列表、引用、setext、frontmatter、定义、表格等。
+  - 链式增量：在增量结果上继续做增量。
+  - 逐项比较 PM 文档、mdast（含位置）和块计数。
+  - 300 轮共比对 15556 次，全部一致。
+- **自检构建 `VITE_HM_SYNC_SELF_CHECK=1 npm run build`**
+  - 每次同步都同时做整篇计算来核对。增量解析不一致时弹「增量解析与整篇解析不一致」；比对缓存不一致时返回 false，同步暂停。
+  - 改动这两处代码后，回归和 fuzz 都要用自检构建跑一遍。
+  - 本轮结果：
+    - 全套回归只有既有的段落测试失败；
+    - 真实文件 100 处位置、133 次编辑，0 问题；
+    - fuzz 默认样本 31–36 和语雀样本多组，均无损坏；
+    - 自检 0 次不一致。
+- **测速脚本**
+  - `scripts/perf/profile-sync.mjs`：CPU profile；加 `COLD=1` 测打开后的第一次编辑。
+  - `scripts/perf/bench-editors.mjs`：HorseMD 和 Obsidian 对同一文件测点击、打字、拖选和 `<font>` 内选中。
+  - `scripts/perf/cpuprofile-summary.py`：汇总 profile。
+  - 注意：`launchBuiltElectron` 总会带 trace。trace 打开时，第一次按键会把整篇文档登记一遍，大文档每键还有约 20 ms 的 IPC 开销。只测用户体验时用 bench，它不带 trace。
+
+### 同期修的一致性问题（语雀）
+
+- **退格合并后，缩进代码被读成列表续行。** 列表下的段落被退格并进列表项后，原来跟在这段后面的「空行 + 4 空格」缩进代码紧贴列表，会被读成列表的续行，这种写法没有编码。
+  - 修法：重印时把这个保留下来的块改写成 ``` 围栏。
+  - 围栏后面以 `2.` 开头的段落写成 `2\.`，因为在围栏后它会变成列表。
+  - 前驱仍是作者写的缩进代码时不改动。
+  - `test:source-reprint-ui` 里加了两条用例。
+- **fuzz 判据误报。** 两个 `<font>` 之间的无标记空格被边缘修剪删掉，导致误报「文件损坏」，文件其实是正确的。已修。
+
+### 后续可做（按收益排序）
+
+1. **拖选和打开后第一次点击。**
+   - Windows 上仍比 Obsidian 慢约 0.2 s，原因是 ProseMirror 全量渲染整篇 DOM。
+   - `hm-cv`（content-visibility）目前只在 ≥1200 块时启用，可以评估降低门槛，或按块高度启用。
+   - 点击后滚到远处，仍有一次约 150 ms 的全量样式重算。
+2. **序列化，每次停顿约 50 ms。**
+   - 规范文本（canonical）要用于列表槽检查，不能省。
+   - 逐块缓存 PM→mdast 能省一半，但有两个难点：Milkdown SerializerState 转换时会改中间节点（`#searchType`/`#moveSpaces`）；`remark-stringify` 的列表符号交替会跨兄弟节点传状态。所以需要自检构建兜底。
+3. **trace 模式下每键约 20 ms**，来自事务 trace 的 IPC，只影响开着 trace 的会话。
+4. **语雀样本 fuzz 仍会暂停的种子。** 都是 fail-closed，上一版在相同步骤也同样暂停：
+
+   | 种子 | 原因 |
+   |---|---|
+   | 41 | 缩进代码后从 2 开始的有序列表，无编码 |
+   | 48 op 108 | 退格把列表并进上一段 |
+   | 52 | 源码里已被编辑成半截 HTML 的文本内加粗 |
+   | 54 op 119 | 重印编辑重叠 |
+
+5. **Air 上与 Obsidian、ColaMD 的对比没测成**：先是屏幕锁定，后来网络经香港中转，传不过去。
+
+
+## 最新实测：0.13.220 → 0.13.222 的真实编辑链
+
+本文下方保留早期分析；当前实际 Redis 文件是 **508802 bytes / 333584 个字符 / 13107 行**，不是32万行。富文本流畅编辑仍是硬需求，不能以让用户停留源码模式代替解决。
+
+### 测试条件和此前验证缺口
+
+旧 `test:redis-typing-latency-ui` 只测关闭trace的20键 beforeinput→input 中位数，而实际交给用户的进程开启trace；也没有统计停止输入后的主线程长任务。这不足以证明用户版本流畅。
+
+新增 `scripts/profile-redis-interaction.mjs`：在原文件独立副本顶部加探针段落，使用相同全文、24次逐字符输入、90ms间隔，对照trace开关；记录beforeinput→input、下一次rAF代理、CDP往返、16ms定时器延迟、PerformanceObserver长任务及CPU profile。这些是隔离后台实例的测量，不是物理键盘到屏幕显示的完整延迟，也不是长期工作负载结论。每轮都校验磁盘全文只发生预期改动；trace逐事件解码并按编辑器ID检查连续文档快照。
+
+| 候选 | trace | 输入p50 / p95 | 输入阶段新增日志 | 停顿后最长任务 |
+| --- | --- | --- | --- | --- |
+| 0.13.220基线 | 关 | 37 / 43 ms | 0 | 1912 ms |
+| 0.13.220基线 | 开 | 68 / 74 ms | 55500901 bytes | 2048 ms |
+| 仅日志优化 | 开 | 35 / 37 ms | 486649 bytes | 1975 ms |
+| 日志 + 评阅扫描优化 | 开 | 17 / 22 ms | 486649 bytes | 1932 ms |
+
+以上为同机单轮对照，不外推为固定倍数。完整证据目录（本机临时目录保留）：`horsemd-redis-profile-MY94HA`（基线）、`horsemd-redis-profile-619W9T`（日志优化）、`horsemd-redis-profile-BnDC7k`（两项优化），位于系统临时目录中，各含JSON和cpuprofile。最后一组42条事务快照连续还原通过。
+
+### 已独立修复
+
+1. `0fc68c8` / 0.13.221：原事务回调先构造oldDoc/newDoc全文JSON，再进入trace开关，因此关日志也有开销；开日志还会重复IPC传输和写入。新helper关闭时零构造，大文档按不可变PM节点身份记录字典和引用，逐条精确还原；小文档保留旧字段，所有事件添加编辑器traceId。没有删去首次分歧所需的文档证据。
+2. `332a32d` / 0.13.222：评阅插件对无评阅正文每键执行全文位置定位。按不可变文本块缓存是否有`{`起始符，否定块直接跳过；有标记的块保留原始跨文本节点解析和所有批注行为。1000段合同doc.resolve从1000次到0；编辑后插入标记、嵌套批注及真实卡片编辑/取消/完成通过。
+
+### 尚未解决的长停顿（不能关闭）
+
+**约1.9秒主线程同步长任务仍在，不能将输入p50下降称为Redis整体流畅。**CPU采样指向 `handleMarkdownUpdatedImpl` 的普通正文legacy路径：批量列表保留逻辑反复定位并比较未编辑列表，同时 `createLegacySourceIntegrityValidator` 在候选/当前canonical/历史source/历史canonical之间多次做全文解析和比较。本轮没有通过删校验、提高延迟阈值或重新规范化用户原文来掩盖它。
+
+下一工作单应把“打字→短暂停顿→继续打字/切源码/立即保存”的主线程最长任务加入失败预算，再沿相同CPU调用链减少重复解析和未变列表匹配；任何缓存须绑定正确文档/解析上下文，任何局部转换仍须通过semantic、list-slot、revision校验。通用Worker拆分或局部权威转换需要独立验证，不能仅为降低耗时开启未验收的全局authority开关。P7c和全局源码一致性P0仍未关闭。
+
+复测命令：`TRACE_MODES=off,on REDIS_INPUT_PATH='<Redis原文件路径>' npm run profile:redis-interaction`。原文件只读，测试写入独立副本。大文档事务新格式为`pm-node-refs-v1`，后续分析必须从日志开头按顺序调用 `createTransactionTraceDecoder()`（`components/editor-transaction-trace.js`）；缺字典时明确报错，不把缺少inline oldDoc误判为未记录。
+
+---
+
+> 用户反馈：打开一个 **~32 万行 / 0.5 MB** 的 `.md` 文件非常卡。
+>
+> 根因是 ProseMirror 全量解析 + 全量 DOM，而当时的「大文档」判定恰好漏掉了「行数极多但有正常空行」的文件。优化分三档列出，P0 多数已落地（见各条 ✅）。
+
+> **⚠️ 产品原则（用户明确，必须遵守）**：heavy 文档的纯文本（textarea）
+> **只是「快速打开」的跳板**，不是目的地。查看、编辑等一切实际使用都
+> **必须在富文本里进行**，用户要能、也理应切到富文本。因此——
+> - P0 的 textarea 回退只解决「打开不卡」，**不**解决「富文本里用大文档」。
+> - **让富文本能流畅承载大文档是硬需求**（P1/P2），不是「可选优化」，
+>   不能以「大多数人文档小」为由搁置。
+> - 任何「让用户留在 textarea」的设计都违背本原则；textarea 是过渡，
+>   富文本是目标。
+
+---
+
+## 一、先厘清一个数据矛盾
+
+32 万行 **不可能是 0.5 MB**：
+
+- 即便每行只有 1 个字符，32 万行 = 32 万字符内容 + 32 万个换行 ≈ **0.7 MB**（纯 ASCII）。
+- 若含中文（UTF-8 下 3 字节/字符），32 万行轻易 **2–5 MB**。
+
+所以「32 万行 / 0.5 MB」二者只能满足其一。两种情况下卡顿根因不同，但**都会卡**，且都能在下面找到对应优化点。本文按「行数极多的超长文档」为主线分析（这是更常见、也更难治的场景）。
+
+---
+
+## 二、卡在哪：完整加载链路与根因
+
+### 链路一图流
+
+```
+双击文件树
+  └─ main: fs.readFile(path, 'utf8')   ← 整文件一次性读入，无流式、无 size 预检  [main/index.js:319]
+       └─ IPC 传整段字符串到渲染层（结构化克隆，大字符串一次性内存拷贝）
+            └─ App.jsx openPaths() 把 content 塞进 tab.content  [App.jsx:344,362]
+                 └─ isHeavyDoc(content) 判定是否走纯文本回退   [paths.js:48]
+                      ├─ 若 heavy → <textarea>，秒开（不卡）
+                      └─ 若不 heavy → 挂载 <Editor initialContent={整段字符串}>  [App.jsx:1451]
+                           └─ Editor.jsx: isLargeDoc(>8000)? 两层 rAF defer create  [Editor.jsx:159,1111]
+                                └─ crepe.create() ← remark 同步解析 → ProseMirror doc → 全量 DOM  [Editor.jsx:510]
+                                     ↑↑↑ 主线程在这里冻结数秒～几十秒
+```
+
+### 根因（按影响排序）
+
+**根因 1：`isHeavyDoc` 漏判了「行数极多但有空行」的文件**（最致命，决定文件根本进不进卡顿路径）
+
+`src/renderer/src/paths.js:48`：
+
+```js
+const HEAVY_MAX_BLOCK_LINES = 150
+const HEAVY_MAX_TOTAL = 400000
+export function isHeavyDoc(content) {
+  if (!content) return false
+  if (content.length > HEAVY_MAX_TOTAL) return true      // ① 总字符数（不是字节）
+  let run = 0
+  for (const line of content.split('\n')) {              // ② 连续非空行
+    if (/^[ \t]*$/.test(line)) run = 0
+    else if (++run > HEAVY_MAX_BLOCK_LINES) return true
+  }
+  return false
+}
+```
+
+它只看 **① 总字符数 > 40 万** 或 **② 最长连续非空行 run > 150**。**完全不看总行数。**
+
+- 若文件有正常的空行分段（每隔几十/几百行一空行）→ 条件② 的 `run` 不断被重置 → 永远到不了 150 → **不判 heavy**。
+- 若 0.5 MB 指磁盘字节且含中文 → JS `content.length` ≈ 17 万 < 40 万 → 条件① 也不触发 → **不判 heavy**。
+
+两种情况都直接进 Milkdown，然后卡死。**这就是用户这个文件大概率遇到的：它没被回退到 textarea。**
+
+> 设计意图（注释 paths.js:40-45）是抓「无空行塌缩成一个巨型段落 + 几千个 `<br>` 内联节点 → ProseMirror 近二次方复杂度」的病态文件。这个意图是对的，但**漏掉了「行数极多的正常结构文档」**这一大类。
+
+**根因 2：ProseMirror 全量解析 + 全量 DOM，无任何虚拟化**
+
+`crepe.create()`（`Editor.jsx:510`）内部：remark **同步**把整段 markdown 解析成 ProseMirror doc，然后**所有节点同步渲染成 DOM**。对几万～几十万段落：
+
+- = N 个 ProseMirror Node 对象常驻内存
+- = N 个 `<p>` DOM 节点一次性插入
+- 浏览器对超大队列 `appendChild` 本身就慢
+
+ProseMirror 的架构是「全量持久化 doc tree」，**不是按需渲染**。这是它对超长文档的固有短板，不是配置能解决的。
+
+**根因 3：`isLargeDoc` 的 defer 没解决同步阻塞**
+
+`Editor.jsx:1111`：
+
+```js
+if (isLargeDoc) {
+  createRaf = requestAnimationFrame(() => {
+    createRaf = requestAnimationFrame(() => runCreate())   // 两层 rAF
+  })
+}
+```
+
+这只让 loading skeleton **先 paint 出来**（用户看到「加载中」而非冻住上一屏），但 `runCreate()` → `crepe.create()` 一旦执行，**仍是同步、单次、整文档解析**，主线程照样冻结整个 parse+render 期间。defer 推迟了 2 个动画帧，没缩短冻结时长。
+
+**根因 4：每次按键也全文档扫描**（卡顿延续到打字时）
+
+- **大纲生成** `App.jsx:844-866`：内容一变就 `querySelectorAll('h1..h6')` 全 DOM 扫描（套了 rAF 合并，但扫描本身仍同步全量）。
+- **`refreshLevel`** `Editor.jsx:484-498`：注释明说「大文档上 selection change + scroll 每次按键触发的同步 reflow 是主要 typing lag」，已用 `scheduleLevel` rAF 合并，但每次仍执行 `coordsAtPos`/`getBoundingClientRect` 等强制 reflow。
+- **`markdownUpdated` 回调**每次编辑 → `onChange(md)` → `updateContent` 更新 tab 状态 → 又触发大纲 effect 重跑。形成「打一个字 → 全文档扫一遍 → 卡」的循环。
+
+**根因 5：读取非流式**（次要，0.5 MB 影响小）
+
+`fs:readFile`（`src/main/filesystem.js`）整体读，没有 `stat` 预检大小、没有 `createReadStream`。0.5 MB 读+IPC 传输是几十 ms 级，不是卡顿主因，但**大文件场景下应预检并给用户预期**。
+
+---
+
+## 二·补：关联 issue #17「滚轮快速滑动后，停止时文本仍继续滚动」
+
+**这是同一个根因家族**，机制是「主线程被强制 reflow 占据 → 滚动呈现滞后 → 合成器线程积压追赶」。
+
+每次 `scroll` 事件触发两条「强制同步布局」链路：
+
+1. **`Editor.jsx:607`** `.editor-scroll` 上 `onScroll` → `scheduleLevel()` → `refreshLevel()`（`:421`）：
+   内含 `view.coordsAtPos(sel.from)` + 多处 `getBoundingClientRect()` —— 全是**强制 reflow**。大文档上每次都要重排整棵 DOM。
+2. **`App.jsx:826`** outline scrollspy 的 `onScroll` → `compute()`：
+   `scroller.querySelectorAll('.ProseMirror h1..h6')` 全文档扫描 + 对每个标题 `getBoundingClientRect()` 找当前查看的标题 —— 又一次强制 reflow。
+
+两条都套了 rAF 合并（`scheduleLevel` / `scrollRaf`），但 rAF 只是「合并到下一帧」，**实际 reflow 仍同步执行**，一帧渲染不完就掉帧。
+
+**为什么表现为「停止后还在滚」**：滚动是 Chromium 合成器线程处理的；JS 主线程被 reflow 占住时，合成器来不及呈现滚动帧，于是把积压的滚动位置在松手后一帧帧「追」着补出来。issue 描述「**快速滑动越多，停止后滚得越多**」强烈印证是积压追赶（输入越多积压越多）——这跟系统惯性滚动（固定物理曲线、与输入量无关）的特征相反。
+
+**文档越大，reflow 越慢，追赶越明显**。即根因 2（全量 DOM）的下游表现。
+
+→ 因此下文的 **P0-3（节流/跳过滚动驱动的 reflow）能同时治这两个问题**：大文档打开卡 + 滚动追赶。
+
+---
+
+
+## 三、可优化的地方（分三档）
+
+### 🟢 P0 — 立即见效、改动小、风险低
+
+> **✅ 已实施（commit `35d41e1`）**：P0-1 + P0-3a/b/c 全部完成。P0-2 待做。
+
+**P0-1. `isHeavyDoc` 增加「总行数」阈值** ✅ 已实施
+
+`paths.js` — 新增 `HEAVY_MAX_LINES = 50000`，在现有的 `split('\n')` 循环中顺带计行数（零额外成本）。超过 5 万行直接判 heavy → textarea 回退。
+
+- **效果**：用户的 32 万行文件立即秒开为 textarea，按需点「渲染为富文本」。
+- **代价**：5 万行以上的「正常结构」富文本文档会被默认当文本打开，需手动切富文本。
+- **局限（重要）**：这只解决「打开不卡」。按文首产品原则，用户仍必须在富文本里查看/编辑大文档——而富文本对大文档的性能是**未解决的硬需求**。P0-1 只是把卡顿从「打开就卡」推迟到「切到富文本才卡」，富文本侧要靠 P1/P2 真正解决。
+
+**P0-2. 读取时预检大小，超大文件给提示** ⬜ 未做
+
+在 `fs:readFile` 前 `fs.stat`，超过某阈值（如 2 MB）时给 main→renderer 一个标志位，UI 提示「文档较大，建议用纯文本模式」。避免「读进来才发现卡」。
+
+- **效果**：用户体验预期更清晰。
+- **风险**：低。
+
+**P0-3a. 大纲 scrollspy（reflow-free 重写）** ✅ 已实施（二次优化）
+
+`App.jsx` outline active-heading 效果。
+- 初版：从每帧 rAF 改为每 **300ms** 节流。解决了主线程被占满，但留下两个问题——
+  ① 节流仍是 leading-edge（`if (scrollTimer) return`），**没有 trailing 更新**：松手后最后一次 compute 是 300ms 前的位置，大纲停在**错误的标题**上；
+  ② 每次 compute 仍 `getBoundingClientRect()` 遍历全部标题，大文档上每次都是**全文档强制 reflow**。
+- **二次优化**：把每个标题的「内容偏移量」`Y = rect.top − scroller.top + scrollTop` **只测一次**（单次布局 pass，每 2s / resize 重建），滚动时只比 `scrollTop`（**零布局读取**）。于是可以**每帧更新**、永远落在当前标题——既不卡，高亮/大纲面板自动滚动也都精准。`Outline.jsx` 的 `scrollIntoView` 依赖 `activeIndex` 变化，所以这一处同时修了「高亮停错」和「大纲不跟滚」。
+- **根因关联**：原 leading-only 节流 + 每帧全文档 reflow = issue #17 滚动追赶 + 大纲停错，是同一根因。
+
+**P0-3b. 移除浮动块类型徽标** ✅ 0.6.5 已实施
+
+早期版本为跟随光标的 level badge 做过节流优化。0.6.5 按产品取舍移除了该纯提示控件，同时删除 selection、mousemove、scroll 路径中的 `coordsAtPos` / `getBoundingClientRect`、定时器和 React 状态；标题快捷键、右键菜单、selection toolbar、状态栏切换和大纲功能不受影响。
+
+**P0-3c. 大纲标题列表 debounce** ✅ 已实施
+
+`App.jsx` outline heading-list 效果：
+- 从每次按键（`rAF` after content change）改为编辑空闲 **500ms** 后扫描一次。
+- 大文档上 `querySelectorAll` 整棵 DOM 是主要按键延迟来源。
+
+---
+
+### 🟡 P1 — 显著改善、需中等改造
+
+**P1-1. 解析与渲染拆分到异步分片（ProseMirror 内）**
+
+`crepe.create()` 之所以阻塞，是「解析 + 渲染」全在一个同步调用里。可改造为：
+
+1. 用 `requestIdleCallback` / `setTimeout(..., 0)` 把 remark 解析**分片**（按 N 行一批，每批之间让出主线程），先构建完整 ProseMirror doc（解析完不一定卡，主要是 DOM 渲染卡）。
+2. DOM 渲染分片：把 doc 切成块，先渲染视口附近的前 K 个块，其余用 `IntersectionObserver` / 虚拟滚动按需挂载。
+
+- **效果**：解析和首屏渲染都不再长阻塞，主线程保持响应。
+- **代价**：**高**。ProseMirror 的 DOM 是它自己管的（通过 EditorView 的 decorations / dispatch），自己造虚拟化要绕过它的 DOM 同步机制，复杂且易引入编辑 bug。这是社区公认的难点（ProseMirror 作者也建议超长文档走 CodeMirror 或分片）。
+- **风险**：高。属较大重构。
+
+**P1-2. 富文本大文档用 CodeMirror「只读快视图」替代**
+
+对 heavy 文档用户主动切富文本时，不进 Milkdown，而进一个 **CodeMirror 6 的 Markdown 只读高亮视图**（CM6 天然支持虚拟滚动，百万行流畅）。需要编辑时再「双击进入编辑区」切回 Milkdown 该段落——但这又是大改。
+
+- **效果**：只读浏览大文档丝滑。
+- **代价/风险**：高，引入双编辑器状态。
+
+**P1-3. `markdownUpdated` → outline 链路解耦**
+
+让大纲不依赖每次 `content` 变化，而是：
+- 编辑时只对「变化的段落范围」增量更新大纲（ProseMirror 的 transaction 能拿到 changed ranges）；
+- 或大纲改为 **debounce 1s + 后台 worker** 解析（Web Worker 跑 remark 提取标题）。
+
+- **效果**：打字时不再触发主线程全文档扫描。
+- **代价**：中。需把 markdown 解析搬到 worker，或写增量 diff 逻辑。
+
+---
+
+### 🔴 P2 — 架构级、长期方案
+
+**P2-1. 大文档走「分块 + 虚拟化富文本」专用编辑器**
+
+放弃用单一 Milkdown 实例承载超长文档。文档按标题/固定行数分块，每块一个独立 Milkdown 子编辑器，视口外的块卸载或冻结。这是 Typora 等也用的高级方案，但工程量极大，且会破坏 ProseMirror 跨块选择/拖拽/查找替换的连贯性。
+
+- **效果**：从根本上让富文本支持任意大文档。
+- **代价/风险**：**高**（工程量大、需维护跨块选择/查找的连贯性）。**但这是目标方向**——按文首产品原则，富文本必须能流畅承载大文档，这条（或 P1 的 `content-visibility` / 分片虚拟化）绕不开，不能因工程量大而搁置。
+
+**P2-2. 流式读取 + 后台解析**
+
+`createReadStream` 分块读 + Web Worker 后台解析成 ProseMirror doc，主线程只接收解析结果。适合 **超大文件（>10 MB）**，0.5 MB 场景收益有限（瓶颈在渲染而非读取）。
+
+---
+
+## 四、推荐执行顺序
+
+| 步骤 | 做什么 | 预期效果 | 工作量 | 状态 |
+|---|---|---|---|---|
+| **1（P0-1）** | `isHeavyDoc` 加 `HEAVY_MAX_LINES` 阈值 | 用户文件立即从「打开就卡几十秒」→「秒开为文本，可按需切富文本」 | 半小时 | ✅ 已完成 |
+| **2（P0-2）** | 读取前 `stat` 预检 + UI 提示 | 超大文件给预期，不再无响应困惑 | 1 小时 | ⬜ 待做 |
+| **3（P0-3a）** | 大纲 scrollspy 节流 300ms + 缓存 heading 元素 | 滚动不再追赶（#17）；打字时少一次全 DOM 扫描 | 1 小时 | ✅ 已完成 |
+| **3（P0-3b）** | `refreshLevel` 节流 200ms | 快速滚动时主线程不被强制 reflow 卡住 | 20 分钟 | ✅ 已完成 |
+| **3（P0-3c）** | 大纲标题列表 debounce 500ms | 大文档打字时不再每键全 DOM 扫描 | 20 分钟 | ✅ 已完成 |
+| 4（P1） | 富文本 `content-visibility: auto`（CSS 层虚拟化） | 富文本里大文档滚动不卡（#17 Windows 软件合成器） | 已完成 | ✅ 已完成 |
+| 4b（P1） | `contain-intrinsic-size` 估算 + `.hm-cv` 下 `overflow-anchor: auto` | 修 content-visibility 引起的「跳页」（#25） | 已完成 | ✅ 已完成 |
+| 5（P2） | 富文本分块虚拟化 / 每节点精确 `contain-intrinsic-size` | 极大文档仍卡时的下一步 | 数天～数周 | ⬜ 待评估 |
+
+**第一/三/四步已完成**（大文件秒开 + 滚动追赶修复 + 富文本 `content-visibility`）。**P2（让富文本流畅承载极大文档）不是可选项**——按文首产品原则,用户打开大文档后必须在富文本里查看/编辑,textarea 只是过渡。
+
+**#25「跳页」修复(重要,易踩):** `content-visibility:auto` 用 `contain-intrinsic-size` 估算屏外块高度,滚入视口时从估算变为真实高度。`.editor-scroll { overflow-anchor:auto }` 会吸收普通段落的高度变化，但选区存在时 Chromium 不保证锚定。CodeMirror 即使 eager-mount，代码块仍远高于 5em 估值，因此 `.editor-scroll.hm-cv` 必须把 `.milkdown-code-block` 排除在 `content-visibility` 外，让其真实高度常驻；表格仍保留 CV，并在操作控件打开时自行退出。`scripts/test-codeblock-scroll-stability-ui.mjs` 用 1300 段的大文档模拟连续滚动，在四处代码块点击并静置，断言视口位移为 0px。**教训:有选择态的复杂块不能只依赖 scroll anchoring，必须消除估高→真实高度的切换。**
+
+---
+
+## 五、关键代码位置索引（供实施时定位）
+
+| 文件 | 内容 | 状态 |
+|---|---|---|
+| `src/renderer/src/paths.js` `isHeavyDoc()` | P0-1：`HEAVY_MAX_LINES = 50000` 行数阈值 | ✅ 已改 |
+| `src/main/filesystem.js` `fs:readFile` handler | P0-2：加 stat 预检 | ⬜ 待做 |
+| `src/renderer/src/App.jsx` outline scrollspy | P0-3a：reflow-free 重写（偏移量测一次 / 滚动只比 scrollTop / 每帧更新） | ✅ 已改（二次） |
+| `src/renderer/src/App.jsx` outline heading-list | P0-3c：setTimeout 500ms debounce | ✅ 已改 |
+| `src/renderer/src/components/Editor.jsx` 滚动 handler | P0-3b：滚动停止 150ms 后算一次（trailing）；`scheduleLevel` typing/selection 仍 200ms leading | ✅ 已改（二次） |
+| `src/renderer/src/components/Editor.jsx` `crepe.create()` | P1-1：同步解析渲染——分片/虚拟化的改造目标 | 未改 |
+| `src/renderer/src/components/Editor.jsx` `isLargeDoc` | `length > 8000` 两层 rAF defer（只 defer，未减阻塞）| 未改 |
+| `src/renderer/src/App.jsx` heavy → textarea 路由 | 配合 `isHeavyDoc` 走纯文本 | 已有 |

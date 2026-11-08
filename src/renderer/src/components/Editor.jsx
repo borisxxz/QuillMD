@@ -1,0 +1,5138 @@
+import { useEffect, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
+import {
+  editorViewCtx,
+  inputRulesCtx,
+  parserCtx,
+  remarkCtx,
+  schemaCtx,
+  serializerCtx
+} from '@milkdown/kit/core'
+import { ParserState } from '@milkdown/kit/transformer'
+import { memoizeLastParses } from '../lib/parse-memo.js'
+import { guardMarkInputRules } from '../lib/input-rule-guards.js'
+import './editor-codeblock-eager.js' // side effect: root-fix #25 — eager, non-tearing code-block node view
+import { chooseCodeBlockMountMode } from './editor-codeblock-eager.js' // #126 cap: lazy mount for block-heavy docs
+import './editor-table-click.js' // side effect: single click in a table cell places the caret
+import {
+  applySerializerStyleToRemark,
+  createSerializerStyleHolder
+} from '../lib/serializer-style.js'
+import { TextSelection } from '@milkdown/prose/state'
+import { BLOCK_TYPES } from '../blocks.js'
+import { useI18n } from '../i18n.jsx'
+import { copyToClipboard, fireToast } from '../ui.js'
+import { Icon } from './icons.jsx'
+import { createImagePersister } from './editor-image-persistence.js'
+import { normalizeDisplayMath } from './editor-math.js'
+import { runHeadingFold } from './editor-heading-fold.js'
+import { splitMarkdown, CHUNK_THRESHOLD, CHUNK_SIZE, appendChunks } from './editor-chunked-parse.js'
+import { createBlockControls } from './editor-block-controls.js'
+import { convertSourceParagraphLineToList } from './editor-block-list-source.js'
+import {
+  applySlashBlockSourceIntent,
+  captureSlashBlockSourceIntent
+} from './editor-slash-source.js'
+import { convertListAtSelection, getListConversionContext } from './editor-list-conversion.js'
+import { normalizeReviewMarkupMarkdown } from '../reviewMarkup.js'
+import { REVIEW_KINDS } from './editor-review.js'
+import { createEditorApi } from './editor-api.js'
+import { useEditorLightboxControls } from './editor-lightbox.js'
+import { applyImageText, createConfiguredCrepe } from './editor-crepe-setup.js'
+import { mountEditorDomBindings } from './editor-dom-bindings.js'
+import { mountEditorInputTrace, traceEditorEvent } from './editor-input-trace.js'
+import { mountSyncEventLog } from './editor-sync-event-log.js'
+import { buildSyncReport, changedRegion, createSyncEventLog, syncReportAction } from '../lib/sync-diagnostics.js'
+import { getCommandShortcut } from '../lib/commands/shortcut-labels.js'
+import {
+  generatedScratchMarkdown,
+  preserveRichMarkdownSource,
+  preserveGeneratedBulletMarkers,
+  preserveOwnedTypedBulletInputRule,
+  preserveTransactionOwnedOrderedEmptySuccessorChain,
+  preserveTransactionOwnedSingleEmptyOrderedBackspaceLift,
+  preserveTransactionOwnedListSubtreeChange,
+  replaceMarkdownFrontmatterBlock,
+  replaceMarkdownListBlock,
+  restoreTypedBulletMarker
+} from '../markdown-source-preservation.js'
+import { createPmPosToMarkdownOffsetMapper, pmPosToMarkdownOffset } from './editor-source-map.js'
+import { createScopedMarkdownOffsetResolver } from './editor-source-map-scope.js'
+import { createEditorTransactionTracer } from './editor-transaction-trace.js'
+import { reconcileUnchangedSourceResult } from '../lib/source-sync/unchanged-source-result.js'
+import {
+  areSourceDocumentsEquivalent,
+  areSourceDocumentsEquivalentWithLiteralEmphasis,
+  formatWholeDocumentReplacementSource,
+  isWholeDocumentReplacementBatch,
+  mapPlainTextTransactionsToSource
+} from '../lib/source-transaction-sync.js'
+import { areMarkdownListSlotsEquivalent } from '../lib/source-structure-fingerprint.js'
+import {
+  blocksRetiredLegacySourceSyncFallback,
+  createBlockquoteExitTransactionSourceSyncOwner,
+  createBlockquoteJoinTransactionSourceSyncOwner,
+  createBlockquoteParagraphTransactionSourceSyncOwner,
+  createBlockquoteSplitTransactionSourceSyncOwner,
+  createCodeBlockExitTransactionSourceSyncOwner,
+  createCodeBlockBoundaryJoinTransactionSourceSyncOwner,
+  createCrossFenceSpanTransactionSourceSyncOwner,
+  createCodeBlockParagraphTransactionSourceSyncOwner,
+  createCodeBlockInfoTransactionSourceSyncOwner,
+  createCodeBlockTransactionSourceSyncOwner,
+  createDocumentReplacementSourceSyncOwner,
+  createEmptyCodeBlockUnpackTransactionSourceSyncOwner,
+  createEditorSourceSyncBridge,
+  createLegacySourceIntegrityValidator,
+  createListConversionSnapshotSourceSyncOwner,
+  createListNestedEmptyBulletTailIndentTransactionSourceSyncOwner,
+  createListNestedNonemptyBulletIndentTransactionSourceSyncOwner,
+  createListNestedSingleChildBulletOutdentTransactionSourceSyncOwner,
+  createListNestedLastChildBulletOutdentTransactionSourceSyncOwner,
+  createListNestedFirstChildBulletOutdentTransactionSourceSyncOwner,
+  createListNestedFirstOrderedParentJoinTransactionSourceSyncOwner,
+  createListNestedBulletSplitTransactionSourceSyncOwner,
+  createListNestedBulletJoinTransactionSourceSyncOwner,
+  createListTaskCheckboxToggleTransactionSourceSyncOwner,
+  createListTaskEmptySiblingSplitTransactionSourceSyncOwner,
+  createListOrderedEmptySuccessorChainTransactionSourceSyncOwner,
+  createListOrderedEmptySuccessorLiftTransactionSourceSyncOwner,
+  createListIsolatedEmptyOrderedLiftTransactionSourceSyncOwner,
+  createListEmptyItemFirstLiftTransactionSourceSyncOwner,
+  createListEmptyItemTailRemoveTransactionSourceSyncOwner,
+  createListEmptyItemRemoveTransactionSourceSyncOwner,
+  createListEmptyItemTextFillTransactionSourceSyncOwner,
+  createListItemParagraphTransactionSourceSyncOwner,
+  createListSubtreeTransactionSourceSyncOwner,
+  createPlainParagraphTransactionSourceSyncOwner,
+  createSourceSyncTransactionJournal,
+  createTableCellTransactionSourceSyncOwner,
+  createTableColumnAlignmentTransactionSourceSyncOwner,
+  createTableColumnDeleteTransactionSourceSyncOwner,
+  createTableColumnInsertTransactionSourceSyncOwner,
+  createTableColumnWidthTransactionSourceSyncOwner,
+  createTableRowDeleteTransactionSourceSyncOwner,
+  createTableRowInsertTransactionSourceSyncOwner,
+  createSlashBlockSourceSyncOwner,
+  createSourceSyncCheckpointStore,
+  findSlashCodeBlockAtSelection,
+  retiredLegacySourceSyncFailureReason
+} from '../lib/source-sync/index.js'
+import {
+  changedTopLevelRange,
+  isHeadingIdOnlyChange,
+  isTrailingEmptyParagraphAppend,
+  sameIgnoringHeadingIds,
+  transactionTopLevelRange
+} from '../lib/source-sync/editor-only-document.js'
+import { reprintVerified } from '../lib/source-reprint/index.js'
+import { forgetParses, incrementalParse, parseMarkdownCached, parseMarkdownFull } from '../lib/source-reprint/incremental-parse.js'
+import { createIncrementalSerializer } from '../lib/incremental-serialize.js'
+import { Transform } from '@milkdown/kit/prose/transform'
+// Self-check build (VITE_HM_SYNC_SELF_CHECK=1, used by the regression and
+// fuzz runs): the incremental parse and the per-block comparison memo are
+// re-checked against the full computation on every sync.
+if (import.meta.env?.VITE_HM_SYNC_SELF_CHECK === '1') {
+  globalThis.__hmIncrementalParseCheck = true
+  globalThis.__hmSemanticMemoCheck = true
+  globalThis.__hmIncrementalSerializeCheck = true
+}
+import { SOURCE_SYNC_OWNERS } from '../lib/source-sync/proof.js'
+import { withoutEmptyContainerParagraphs } from '../lib/source-sync/validator.js'
+import { createTopLevelBlockRemovalTransactionSourceSyncOwner } from '../lib/source-sync/top-level-block-removal-transaction-owner.js'
+import {
+  createSourceSnapshotHistory,
+  isHistoryTransactionBatch,
+  planHistorySourceRestore
+} from '../lib/source-sync/history-source-restore.js'
+import {
+  hasBlockingSourceSyncListInputIntent,
+  isSourceSyncListInputIntentActive,
+  markSourceSyncListInputIntentConsumed
+} from '../lib/source-sync/list-input-intent-lifecycle.js'
+
+// Every mounted rich editor registers itself here. A rich-text tab stays mounted
+// after its first activation, so several editors (and several Crepe selection
+// toolbars) can coexist. The heading button injected into a toolbar resolves its
+// target editor at click time — the one that currently owns the selection —
+// instead of capturing a single instance, which previously made the button act
+// on the wrong (hidden) tab when more than one tab was open.
+const liveEditors = new Set()
+
+// Line ending of the source line that holds `offset` (else of the nearest
+// line before it; LF in a one-line file).
+const localLineEnding = (source, offset) => {
+  const text = String(source || '')
+  const at = Math.max(0, Math.min(text.length, offset || 0))
+  const next = text.indexOf('\n', at)
+  if (next >= 0) return text[next - 1] === '\r' ? '\r\n' : '\n'
+  const previous = text.lastIndexOf('\n', at - 1)
+  if (previous >= 0) return text[previous - 1] === '\r' ? '\r\n' : '\n'
+  return '\n'
+}
+
+/**
+ * WYSIWYG editor (Milkdown Crepe) with Typora-style block-level controls.
+ *
+ * Ways to change a block's level — all driven through one `setBlock` path:
+ *   - Keyboard:        Ctrl+1…6 → headings, Ctrl+0 → paragraph
+ *   - Selection toolbar: an "H" button injected into Crepe's bold/italic
+ *                        toolbar; hover it to reveal H1 / H2 / H3 / ¶
+ *   - Right-click:     context menu with the full list + shortcuts
+ *   - Status bar:      always-visible switcher (wired from App via onReady)
+ *   - Plus Crepe's built-in slash menu (`/`) and block handle.
+ */
+// SVG images (#162) are vector: open them fitted to the window, keeping their
+// ratio, instead of at the 300×150 an SVG without a width defaults to.
+const isVectorImageSrc = (src) => /^data:image\/svg\+xml|\.svg(?:[?#]|$)/i.test(src || '')
+const fitVectorLightboxImage = (event) => {
+  const image = event.currentTarget
+  if (!image.classList.contains('hm-lightbox-vector')) return
+  const width = image.naturalWidth
+  const height = image.naturalHeight
+  if (!width || !height) return
+  const maxHeight = parseFloat(getComputedStyle(image).maxHeight)
+  const scale = Math.min(
+    (window.innerWidth * 0.9) / width,
+    (Number.isFinite(maxHeight) ? maxHeight : window.innerHeight * 0.95 - 64) / height
+  )
+  image.style.width = `${width * scale}px`
+  image.style.height = `${height * scale}px`
+}
+
+export default function Editor({
+  initialContent,
+  docPath,
+  imageUploadCommand,
+  spellcheck,
+  inlineMathDeleteMode,
+  markdownSyntax,
+  selectionToolbar,
+  onToggleSourceRichSplit,
+  readOnly = false,
+  effectiveKeybindings,
+  onChange,
+  onRichEditPending,
+  onReady,
+  onActiveBlock,
+  onStructureChange,
+  onLoadingChange
+}) {
+  const { t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
+  // Live mirror of the image-host upload command, read at upload time (the Crepe
+  // onUpload callback is registered once at create but always uses the latest).
+  const uploadCmdRef = useRef(imageUploadCommand)
+  uploadCmdRef.current = imageUploadCommand
+  // Live mirror of the spell-check pref: applied to view.dom on mount (below) and
+  // re-applied by the effect when the pref changes.
+  const spellcheckRef = useRef(spellcheck)
+  spellcheckRef.current = spellcheck
+  // Read live by the parser and input rules (editor-subsup.js); a change
+  // re-renders the open document (effect below).
+  const markdownSyntaxRef = useRef(markdownSyntax)
+  markdownSyntaxRef.current = markdownSyntax
+  const resetParseCachesRef = useRef(null)
+  const inlineMathDeleteModeRef = useRef(inlineMathDeleteMode || 'protect')
+  inlineMathDeleteModeRef.current = inlineMathDeleteMode || 'protect'
+  // The Crepe toolbar remains mounted so changing this setting is immediate and
+  // does not recreate a rich editor. The interaction binding reads this ref to
+  // decide when the right-click menu should expose text-format actions.
+  const selectionToolbarRef = useRef(selectionToolbar !== false)
+  selectionToolbarRef.current = selectionToolbar !== false
+  const readOnlyRef = useRef(readOnly)
+  readOnlyRef.current = readOnly
+  // Crepe can paint its ProseMirror DOM a few synchronous steps before its
+  // source baseline and public API are ready. Never accept input in that
+  // window: an edit there used to be incorporated into the initial baseline
+  // without ever reaching `onChange`, so source mode and saves could lose it.
+  const interactionReadyRef = useRef(false)
+  const effectiveKeybindingsRef = useRef(effectiveKeybindings)
+  effectiveKeybindingsRef.current = effectiveKeybindings
+  const hostRef = useRef(null)
+  const viewRef = useRef(null)
+  // Incremental serializer of this editor (lib/incremental-serialize.js).
+  const incrementalSerializerRef = useRef(null)
+  const fullSerializerRef = useRef(null)
+  const apiRef = useRef(null)
+  const crepeRef = useRef(null)
+  const lastBlockRef = useRef(null)
+  // Re-apply the spellcheck attribute when the pref changes after mount (the
+  // initial value is set during create above).
+  useEffect(() => {
+    const v = viewRef.current
+    if (v?.dom) v.dom.setAttribute('spellcheck', spellcheck ? 'true' : 'false')
+  }, [spellcheck])
+  // Settings › Markdown syntax changed: the same Markdown now parses
+  // differently, so drop every cached parse and re-render the document from
+  // its current source (nothing is written; the source is unchanged).
+  const syntaxKey = `${markdownSyntax?.subscript === true}|${markdownSyntax?.superscript === true}`
+  const syntaxKeyRef = useRef(syntaxKey)
+  useEffect(() => {
+    if (syntaxKeyRef.current === syntaxKey) return
+    syntaxKeyRef.current = syntaxKey
+    const api = apiRef.current
+    // Take the source BEFORE the escape list follows the new setting (a
+    // flush afterwards would re-escape literal `a^2^` as `a\^2\^`). Unforced:
+    // the committed source as is, unless a rich edit is still pending.
+    let markdown = null
+    try { markdown = api?.flushMarkdown?.() } catch { markdown = null }
+    resetParseCachesRef.current?.()
+    if (typeof markdown !== 'string') return
+    try { api.replaceMarkdown?.(markdown) } catch { /* editor teardown */ }
+  }, [syntaxKey])
+  // Keep native selection and scrolling available while making the underlying
+  // ProseMirror view genuinely non-editable. A CSS-only lock still accepts
+  // paste/drop and lets input rules mutate the document.
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view?.dom) return
+    const editable = interactionReadyRef.current && !readOnly
+    try { view.setProps({ editable: () => editable }) } catch { /* view is tearing down */ }
+    view.dom.contentEditable = editable ? 'true' : 'false'
+    view.dom.setAttribute('aria-readonly', readOnly ? 'true' : 'false')
+  }, [readOnly])
+  // Crepe does not re-position its tooltip until the next selection update.
+  // Restore the current one here so enabling the preference is immediate and
+  // never requires an editor remount.
+  useEffect(() => {
+    if (selectionToolbar === false) return
+    const view = viewRef.current
+    if (!view || view.state.selection.empty) return
+    const host = view.dom.closest('.milkdown') || view.dom.parentElement
+    const toolbar = host?.querySelector('.milkdown-toolbar')
+    if (toolbar) toolbar.dataset.show = 'true'
+  }, [selectionToolbar])
+  const [ctxMenu, setCtxMenu] = useState(null) // { x, y } viewport coords, or null
+  // Lightbox: the image src currently shown enlarged, or null.
+  const [zoom, setZoom] = useState(null)
+  // Mermaid-lightbox pan/zoom state (refs so dragging doesn't re-render per frame).
+  // Adapted from @digyear's PR #27 (Mermaid fullscreen lightbox).
+  const lightboxScaleRef = useRef(1)
+  const lightboxContentRef = useRef(null)
+  const lightboxTranslateRef = useRef({ x: 0, y: 0 })
+  const [lightboxScale, setLightboxScale] = useState(1)
+  const { fitToWindow, showActualSize, zoomIn, zoomOut } = useEditorLightboxControls({
+    zoom,
+    setZoom,
+    scaleRef: lightboxScaleRef,
+    translateRef: lightboxTranslateRef,
+    contentRef: lightboxContentRef,
+    setScaleLabel: setLightboxScale
+  })
+  // False until Crepe has parsed and rendered the document — drives the loading
+  // skeleton. Only large documents (which actually take a moment to render) show
+  // it, so small files never flash a placeholder.
+  const [loaded, setLoaded] = useState(false)
+  // Below this, docs parse fast enough to create synchronously. At or above it we
+  // show a skeleton and defer create past a paint, so opening / switching to a
+  // biggish doc shows feedback (and lets a queued click through) before the
+  // synchronous ProseMirror parse blocks the main thread.
+  const isLargeDoc = (initialContent?.length || 0) > 8000
+  // Huge docs are split into chunks and parsed incrementally (see splitMarkdown):
+  // the first chunk is the editor's initial content, the rest are appended in the
+  // background after create(). `chunks` is null for normal-sized docs.
+  const chunks = (initialContent?.length || 0) > CHUNK_THRESHOLD ? splitMarkdown(initialContent, CHUNK_SIZE) : null
+  const firstContent = chunks ? chunks[0] : initialContent || ''
+  // A newly-created (or initially empty) document has no authored Markdown
+  // layout to preserve yet. During its first rich-text writing session, using
+  // the current ProseMirror serialization as the structural source of truth
+  // avoids replaying intermediate empty-list transactions into later lists.
+  // Existing documents always retain the local-delta preservation path below.
+  const generatedScratchRef = useRef(!(initialContent || '').trim())
+  // RS-52: after generated scratch removes one empty list item, keep the exact
+  // committed source/canonical pair that owns the editor-only trailing empty
+  // paragraph. A later fill may reuse the local mapper only while both
+  // snapshots still match this checkpoint; any intervening rich transaction
+  // makes the token stale automatically.
+  const generatedPostListEmptyTransientRef = useRef(null)
+  // Keep the source snapshot separate from Crepe's canonical serialization.
+  // The first is what the user wrote; the second lets us isolate a rich-text
+  // transaction instead of replacing untouched source with formatter output.
+  const lastMarkdownRef = useRef(initialContent || '')
+  const canonicalMarkdownRef = useRef('')
+  const programmaticReplaceRef = useRef(null)
+
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host) return
+    interactionReadyRef.current = false
+    let ready = false
+    let destroyed = false
+    let hasSyntheticEmptyTitle = false
+    let createRaf = 0
+    const cleanups = []
+    // Sync diagnostics (lib/sync-diagnostics.js): the last input events, and a
+    // snapshot taken when sync fails — the report itself is built only when
+    // the user opens it.
+    const syncEventLog = createSyncEventLog()
+    const captureSyncReport = (reason, where) => {
+      const doc = viewRef.current?.state.doc
+      const source = lastMarkdownRef.current || ''
+      const events = syncEventLog.entries()
+      const at = new Date().toISOString()
+      return () => {
+        let region = null
+        try {
+          if (doc && crepeRef.current) {
+            const ctx = crepeRef.current.editor.ctx
+            const sourceDoc = ctx.get(parserCtx)(source)
+            const mapOffset = createPmPosToMarkdownOffsetMapper(source, sourceDoc, ctx.get(remarkCtx))
+            region = changedRegion({ source, sourceDoc, editorDoc: doc, mapOffset, serialize: ctx.get(serializerCtx) })
+          }
+        } catch (error) {
+          region = { error: error?.message || String(error) }
+        }
+        return buildSyncReport({
+          version: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '',
+          platform: window.api?.platform,
+          userAgent: navigator.userAgent,
+          where,
+          reason,
+          at,
+          source,
+          region,
+          events
+        })
+      }
+    }
+    const canonicalForSource = (markdown) => {
+      const canonical = normalizeReviewMarkupMarkdown(markdown)
+      if (!hasSyntheticEmptyTitle) return canonical
+      // The synthetic title owns every immediately following blank line until
+      // the first authored body block. A list input rule can temporarily make
+      // Crepe serialize that skeleton as `#\n\n\n- ...`; stripping only two
+      // newlines leaks a phantom blank prefix into a brand-new document's
+      // source. This branch runs only while the title itself remains empty.
+      const emptyTitle = canonical.match(/^#[ \t]*(?:\r?\n)+/)
+      if (emptyTitle) return canonical.slice(emptyTitle[0].length)
+      // Once the user types in or transforms the optional title, it becomes
+      // authored Markdown and participates in every later source delta.
+      hasSyntheticEmptyTitle = false
+      return canonical
+    }
+    // Register this editor so a globally-injected toolbar button can find the
+    // editor that currently has the selection. Getters read the live refs.
+    const self = { host, getView: () => viewRef.current, getApi: () => apiRef.current }
+    liveEditors.add(self)
+    cleanups.push(() => liveEditors.delete(self))
+
+    const persistImage = createImagePersister({
+      docPath,
+      getUploadCommand: () => uploadCmdRef.current,
+      getT: (key) => tRef.current(key),
+      notify: fireToast
+    })
+
+    let userEditUntil = 0
+    // `markdownUpdated` normally catches up immediately, but a mode switch can
+    // happen in the narrow gap after a visible ProseMirror transaction. Keep a
+    // precise flag for that gap: it preserves the required immediate flush
+    // without serializing a 400K+ document again for a reading-only toggle.
+    let richFlushPending = false
+    let pendingRichBlockKey = null
+    let richDirtyReconcileTimer = 0
+    let cancelDeferredMarkdownSync = () => {}
+    // True while a markdownUpdated callback for the live document is still
+    // coming (Milkdown's 200 ms debounce) or queued (heavy-doc deferral).
+    let isMarkdownSyncPending = () => false
+    // Last document Milkdown's listener delivered (its debounce fired); the
+    // loaded document until the first delivery.
+    let deliveredDoc = null
+    let transactionSourcePendingPublish = false
+    let transactionSourcePendingDoc = null
+    let transactionSourceBlockHints = []
+    let transactionSourceQuarantined = false
+    // One revision-bound transaction journal spans the listener's deferred
+    // callback window. It owns PM transaction/StepMap evidence for every normal
+    // edit family; focused owners may consume it, but none may keep a private
+    // lifecycle token or silently rebase it after another publication.
+    let pendingSourceSyncTransactionJournal = null
+    let wholeDocumentReplacementPending = null
+    const currentRichBlockKey = () => {
+      const selection = viewRef.current?.state.selection
+      const $from = selection?.$from
+      if (!$from?.parent?.isTextblock || $from.depth < 1) return null
+      try {
+        // Use the owning top-level block position, not the textblock's own
+        // position. A Markdown input rule can wrap the same paragraph in a
+        // bullet/ordered list between two keystrokes; its textblock position
+        // then shifts even though the user never moved, which would make a
+        // boundary flush persist the intermediate `* <br />` list skeleton.
+        // The wrapper starts at the former paragraph position, so depth 1 is
+        // stable for that structural transition while still separating a
+        // heading, a later list, and other unrelated top-level blocks.
+        return `top:${$from.before(1)}`
+      } catch {
+        return null
+      }
+    }
+    const markUserEdit = (ttl = 8000, { pointer = false } = {}) => {
+      // A press arrives before the selection moves, so the current block is
+      // the one being LEFT: it must not become the pending block (the first
+      // keystroke after clicking elsewhere would then force a full flush).
+      const blockKey = pointer ? null : currentRichBlockKey()
+      // Milkdown batches markdownUpdated for about 200 ms. If the user edits
+      // one block, immediately moves to another, then edits again, a single
+      // callback can contain unrelated heading/list/quote deltas that no
+      // bounded source mapper can safely own. Commit the completed block while
+      // the next block has not mutated yet. Continuous typing in one block
+      // remains batched, so this does not serialize the document per keypress.
+      if (
+        richFlushPending &&
+        pendingRichBlockKey &&
+        blockKey &&
+        blockKey !== pendingRichBlockKey &&
+        // Space on a captured `-` / `*` / `+` / ordered marker structurally
+        // wraps the SAME paragraph in a list before Milkdown's markdownUpdated
+        // callback. During that known transition the top-level PM key can move,
+        // but flushing here races ahead of the exact marker-ownership bridge and
+        // produces a false source mismatch. Real cross-block edits have no
+        // active list input intent and still flush immediately.
+        !hasBlockingListInputIntent()
+      ) {
+        const markdown = apiRef.current?.flushMarkdown?.()
+        if (typeof markdown === 'string') onChange?.(markdown, false)
+      }
+      programmaticReplaceRef.current = null
+      userEditUntil = Date.now() + ttl
+      richFlushPending = true
+      pendingRichBlockKey = blockKey || pendingRichBlockKey
+    }
+    // Milkdown's listener batches markdownUpdated for 200ms. A user can type
+    // and then revert within that window, leaving its final ProseMirror doc
+    // equal to the listener's previous doc; Milkdown correctly skips the
+    // callback, but QuillMD's immediate dirty hint must then be cleared. This
+    // one-shot reconciliation runs only after a real DOM mutation and only
+    // while the regular listener has not already settled the change.
+    let richDirtyReconcileSince = 0
+    const scheduleRichDirtyReconcile = (delayMs = 260, { keepSince = false } = {}) => {
+      if (!keepSince || !richDirtyReconcileSince) richDirtyReconcileSince = Date.now()
+      if (richDirtyReconcileTimer) clearTimeout(richDirtyReconcileTimer)
+      richDirtyReconcileTimer = window.setTimeout(() => {
+        richDirtyReconcileTimer = 0
+        if (destroyed || !richFlushPending) return
+        // The list input-rule callback is authoritative for this structural
+        // transition. If Milkdown is slower than the normal 200ms debounce,
+        // don't let dirty reconciliation race it with a generic serializer
+        // flush; retry after a short interval while the captured intent remains
+        // active. If the callback never arrives, normal reconciliation resumes
+        // once the bounded intent window expires.
+        // Same for an active IME composition: a pause on uncommitted pinyin
+        // must not flush transient candidate text (compositionend delivers
+        // the committed characters through markdownUpdated).
+        if (hasBlockingListInputIntent() || viewRef.current?.composing) {
+          scheduleRichDirtyReconcile(120)
+          return
+        }
+        // The regular sync is still on its way: on a large document it is
+        // deliberately deferred until typing pauses, and flushing here would
+        // run the full reprint + verification in the middle of typing anyway
+        // (seconds per pause on Windows). Check again after it had its turn.
+        // Bounded: Milkdown never delivers addToHistory:false transactions,
+        // so after a few seconds fall back to the flush.
+        if (isMarkdownSyncPending() && Date.now() - richDirtyReconcileSince < 3000) {
+          scheduleRichDirtyReconcile(400, { keepSince: true })
+          return
+        }
+        richDirtyReconcileSince = 0
+        const markdown = apiRef.current?.flushMarkdown?.()
+        if (typeof markdown === 'string') onChange?.(markdown, false)
+      }, delayMs)
+    }
+    const hasRecentUserEdit = () => Date.now() <= userEditUntil
+    // A document whose sync is worth deferring while typing and warming up
+    // after opening. Yuque exports are mostly tag bytes: 350 KB of source is
+    // under 100 000 of document content.
+    const isLargeSyncDocument = (doc) => (doc?.content?.size || 0) > 50000 ||
+      String(lastMarkdownRef.current ?? '').length > 150000
+    const clearRichFlushPending = () => {
+      cancelDeferredMarkdownSync()
+      richFlushPending = false
+      pendingRichBlockKey = null
+    }
+    const pendingRawMarkdownPasteRef = { current: null }
+    let pendingListConversion = null
+    let pendingMarkdownInputIntent = null
+    const isActiveListInputIntent = (intent) =>
+      isSourceSyncListInputIntentActive(intent)
+    const hasBlockingListInputIntent = () =>
+      hasBlockingSourceSyncListInputIntent(
+        pendingMarkdownInputIntents,
+        pendingMarkdownInputIntent
+      )
+    // A physical/IME input sequence can create an outer list and a nested list
+    // before Milkdown emits its first markdownUpdated callback. Keep every
+    // marker intent until that callback serializes the generated document;
+    // retaining only the latest intent loses the outer marker (`1.` -> `1)`).
+    let pendingMarkdownInputIntents = []
+    let pendingSlashBlockIntent = null
+    let appending = false
+
+    // Insert an image at the caret (used by paste / drop of image files). Persists
+    // the file first, then drops an inline image node with the resulting src.
+    const insertUploadedImage = async (file, fromClipboard = false) => {
+      if (readOnlyRef.current) return
+      const url = await persistImage(file, fromClipboard)
+      const v = viewRef.current
+      if (!v || !url) return
+      const imgType = v.state.schema.nodes.image
+      if (!imgType) return
+      const node = imgType.create({ src: url, alt: file.name || '' })
+      markUserEdit()
+      v.dispatch(v.state.tr.replaceSelectionWith(node, false).scrollIntoView())
+    }
+
+    const handleFrontmatterValueChange = ({ view, getPos }) => {
+      try {
+        const pos = getPos?.()
+        if (!Number.isFinite(pos)) return
+        // Node-view attribute transactions can be plugin-owned and may not
+        // publish Milkdown's cached Markdown immediately. Serialize the exact
+        // live PM document so candidate canonical and expectedDoc share one
+        // revision at the Coordinator boundary.
+        const canonical = canonicalForSource(
+          crepe.editor.ctx.get(serializerCtx)(view.state.doc)
+        )
+        // If markdownUpdated already committed the same live document, this
+        // callback is only an acknowledgement and must not publish twice.
+        if (canonical === canonicalMarkdownRef.current) return
+        const remark = crepe.editor.ctx.get(remarkCtx)
+        const sourceOffset = pmPosToMarkdownOffset(lastMarkdownRef.current, pos, view.state.doc, remark)
+        const nextOffset = pmPosToMarkdownOffset(canonical, pos, view.state.doc, remark)
+        const markdown = Number.isFinite(sourceOffset) && Number.isFinite(nextOffset)
+          ? replaceMarkdownFrontmatterBlock({
+              source: lastMarkdownRef.current,
+              next: canonical,
+              sourceOffset,
+              nextOffset
+            })
+          : null
+        const result = markdown
+          ? {
+              markdown,
+              preserved: true,
+              reason: 'frontmatter-block-change'
+            }
+          : preserveRichMarkdownSource(
+              lastMarkdownRef.current,
+              canonicalMarkdownRef.current,
+              canonical
+            )
+        if (result.preserved === false) {
+          userEditUntil = Date.now() + 1000
+          return
+        }
+        const coordinated = sourceSyncBridge.publish({
+          result,
+          canonical,
+          expectedDoc: view.state.doc,
+          validationSite: 'frontmatter-value-change',
+          boundary: 'frontmatter-value-change',
+          notifyChange: true
+        })
+        if (!coordinated?.ok) {
+          userEditUntil = Date.now() + 1000
+          return
+        }
+        pendingSourceSyncTransactionJournal = null
+        clearRichFlushPending()
+      } catch {
+        // The live editor remains correct; the normal markdownUpdated callback
+        // still owns fallback serialization if a mapper/plugin is unavailable.
+      }
+    }
+
+    const handleInlineCodeValueChange = () => {
+      try {
+        // Inline-code transactions are plugin-owned and can run before
+        // Crepe's cached getMarkdown() snapshot catches up. Serialize the live
+        // ProseMirror document, matching save/source-switch durability rules.
+        const view = viewRef.current
+        const markdown = view
+          ? crepe.editor.ctx.get(serializerCtx)(view.state.doc)
+          : crepe.getMarkdown()
+        const canonical = canonicalForSource(markdown)
+        if (canonical === canonicalMarkdownRef.current) return
+        const preserved = preserveRichMarkdownSource(
+          lastMarkdownRef.current,
+          canonicalMarkdownRef.current,
+          canonical
+        )
+        // Never confirm a canonical baseline for an edit whose authored source
+        // ownership was not proven. Advancing here used to hide the failed
+        // inline-code transaction until a later save/source switch became
+        // permanently fail-closed.
+        if (preserved.preserved === false) {
+          userEditUntil = Date.now() + 1000
+          return
+        }
+        const coordinated = sourceSyncBridge.publish({
+          result: preserved,
+          canonical,
+          expectedDoc: view?.state.doc,
+          validationSite: 'inline-code-value-change',
+          boundary: 'inline-code-value-change',
+          notifyChange: true
+        })
+        if (!coordinated?.ok) {
+          userEditUntil = Date.now() + 1000
+          return
+        }
+        pendingSourceSyncTransactionJournal = null
+        clearRichFlushPending()
+      } catch {
+        // The editor remains usable if serialization is transiently unavailable;
+        // normal markdownUpdated remains the fallback for ordinary input.
+      }
+    }
+
+    const documentReplacementSourceSyncOwner = createDocumentReplacementSourceSyncOwner({
+      formatWholeDocumentSource: formatWholeDocumentReplacementSource
+    })
+    const sourceSnapshotHistory = createSourceSnapshotHistory()
+    const listConversionSnapshotSourceSyncOwner = createListConversionSnapshotSourceSyncOwner()
+    const slashBlockSourceSyncOwner = createSlashBlockSourceSyncOwner({
+      preserve: preserveRichMarkdownSource,
+      captureIntent: captureSlashBlockSourceIntent,
+      applyIntent: applySlashBlockSourceIntent
+    })
+
+    let crepe
+    let sourceSyncBridge = null
+    const sourceSyncTransactionJournal = createSourceSyncTransactionJournal()
+    const transactionMarkdownOffsets = createScopedMarkdownOffsetResolver()
+    const resolveTransactionMarkdownOffset = ({ markdown, pmPos, doc }) => {
+      const remark = crepe.editor.ctx.get(remarkCtx)
+      return transactionMarkdownOffsets.resolve({ markdown, pmPos, doc, remark })
+    }
+    // One sync verifies the same candidate against the same document several
+    // times (reprint escape levels, trace shadow, owners); each is a full
+    // parse/serialize, seconds on a 250 KB file. Remember the last of each.
+    const lastValidationParse = { markdown: null, doc: null }
+    // Parse a candidate through mdast (what Milkdown's parser does inside) and
+    // keep the mdast: once published, the candidate is the next sync's
+    // committed source, which the reprint engine would otherwise parse again.
+    const parseCandidate = (markdown, parser) => {
+      if (typeof markdown !== 'string' || markdown.startsWith('\uFEFF')) return parser(markdown)
+      let doc
+      try {
+        // Reparses only the blocks the edit touched (incremental-parse.js);
+        // unchanged blocks keep their nodes, so the comparison skips them.
+        doc = parseMarkdownCached(crepe.editor.ctx.get(remarkCtx), crepe.editor.ctx.get(schemaCtx), markdown, {
+          onMismatch: (report) => {
+            traceEditorEvent('incremental-parse-mismatch', report)
+            fireToast(`增量解析与整篇解析不一致（${report.length}）`, { sticky: true })
+          }
+        }).srcDoc
+      } catch {
+        return parser(markdown)
+      }
+      parser.prime?.(markdown, doc)
+      return doc
+    }
+    const lastValidationCanonical = { doc: null, markdown: null }
+    resetParseCachesRef.current = () => {
+      lastValidationParse.markdown = null
+      lastValidationParse.doc = null
+      lastValidationCanonical.doc = null
+      try {
+        forgetParses(crepe.editor.ctx.get(remarkCtx))
+        crepe.editor.ctx.get(parserCtx).clear?.()
+        crepe.hmSyncSubSupUnsafe?.()
+      } catch { /* editor not created yet */ }
+    }
+    const validateTransactionMarkdown = ({ markdown, expectedDoc, semanticOptions = {} }) => {
+      const parser = crepe.editor.ctx.get(parserCtx)
+      const serializer = crepe.editor.ctx.get(serializerCtx)
+      if (lastValidationParse.markdown !== markdown || !lastValidationParse.doc) {
+        lastValidationParse.doc = parseCandidate(markdown, parser)
+        lastValidationParse.markdown = markdown
+      }
+      const parsed = lastValidationParse.doc
+      if (lastValidationCanonical.doc !== expectedDoc) {
+        lastValidationCanonical.markdown = canonicalForSource(serializer(expectedDoc))
+        lastValidationCanonical.doc = expectedDoc
+      }
+      const expectedCanonical = lastValidationCanonical.markdown
+      const inheritedSemanticOptions = sourceSyncBridge?.getSemanticOptions(expectedDoc) || {}
+      const mergedSemanticOptions = {
+        ...inheritedSemanticOptions,
+        ...semanticOptions,
+        ignoreTrailingEmptyBlockquoteParagraphPaths: [
+          ...(inheritedSemanticOptions.ignoreTrailingEmptyBlockquoteParagraphPaths || []),
+          ...(semanticOptions.ignoreTrailingEmptyBlockquoteParagraphPaths || [])
+        ]
+      }
+      if (!areSourceDocumentsEquivalent(parsed, expectedDoc, mergedSemanticOptions)) {
+        // Option A (Typora parity): the reprint may spell bold/italic that
+        // Markdown cannot delimit there as literal `*`/`_`; nothing else may
+        // differ (no list structure is involved in that difference).
+        return semanticOptions.relaxOrderedNumbers === true &&
+          areSourceDocumentsEquivalentWithLiteralEmphasis(parsed, expectedDoc, mergedSemanticOptions)
+      }
+      if (areMarkdownListSlotsEquivalent(markdown, expectedCanonical, {
+        // Source reprint keeps the author's numbering (`1. 1. 1.`) or
+        // renumbers deliberately; only the start number has meaning and the
+        // document comparison checks it (ordered_list `order`).
+        strictOrderedNumbers: semanticOptions.relaxOrderedNumbers !== true,
+        previousMarkdown: canonicalMarkdownRef.current
+      })) return true
+      if (semanticOptions.relaxOrderedNumbers !== true) return false
+      // Source reprint: list slots are read from the canonical TEXT, and
+      // Milkdown prints an editor-only empty paragraph inside a list item or
+      // quote as `- <br />` + lazy text, which the slot reader cannot follow
+      // (fuzz seed 75). Those paragraphs have no Markdown encoding (design
+      // §5), so read the slots from the document without them.
+      return areMarkdownListSlotsEquivalent(markdown, canonicalForSource(serializer(withoutEmptyContainerParagraphs(expectedDoc))), {
+        strictOrderedNumbers: false,
+        previousMarkdown: canonicalMarkdownRef.current
+      })
+    }
+    const listSubtreeTransactionSourceSyncOwner = createListSubtreeTransactionSourceSyncOwner({
+      mapListSubtree: preserveTransactionOwnedListSubtreeChange,
+      resolveMarkdownOffset: resolveTransactionMarkdownOffset
+    })
+    const listItemParagraphTransactionSourceSyncOwner =
+      createListItemParagraphTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedEmptyBulletTailIndentTransactionSourceSyncOwner =
+      createListNestedEmptyBulletTailIndentTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedNonemptyBulletIndentTransactionSourceSyncOwner =
+      createListNestedNonemptyBulletIndentTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedSingleChildBulletOutdentTransactionSourceSyncOwner =
+      createListNestedSingleChildBulletOutdentTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedLastChildBulletOutdentTransactionSourceSyncOwner =
+      createListNestedLastChildBulletOutdentTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedFirstChildBulletOutdentTransactionSourceSyncOwner =
+      createListNestedFirstChildBulletOutdentTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedFirstOrderedParentJoinTransactionSourceSyncOwner =
+      createListNestedFirstOrderedParentJoinTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedBulletSplitTransactionSourceSyncOwner =
+      createListNestedBulletSplitTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listNestedBulletJoinTransactionSourceSyncOwner =
+      createListNestedBulletJoinTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listTaskCheckboxToggleTransactionSourceSyncOwner =
+      createListTaskCheckboxToggleTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listTaskEmptySiblingSplitTransactionSourceSyncOwner =
+      createListTaskEmptySiblingSplitTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const listOrderedEmptySuccessorChainTransactionSourceSyncOwner =
+      createListOrderedEmptySuccessorChainTransactionSourceSyncOwner({
+        mapOrderedChain: preserveTransactionOwnedOrderedEmptySuccessorChain,
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset
+      })
+    const listOrderedEmptySuccessorLiftTransactionSourceSyncOwner =
+      createListOrderedEmptySuccessorLiftTransactionSourceSyncOwner({
+        mapOrderedLift: preserveTransactionOwnedSingleEmptyOrderedBackspaceLift,
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset
+      })
+    const listIsolatedEmptyOrderedLiftTransactionSourceSyncOwner =
+      createListIsolatedEmptyOrderedLiftTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset
+      })
+    const listEmptyItemFirstLiftTransactionSourceSyncOwner =
+      createListEmptyItemFirstLiftTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset
+      })
+    const listEmptyItemTailRemoveTransactionSourceSyncOwner =
+      createListEmptyItemTailRemoveTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset
+      })
+    const listEmptyItemRemoveTransactionSourceSyncOwner =
+      createListEmptyItemRemoveTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset
+      })
+    // Trace 38723 (0.13.207, 2026-09-12 10:16): an IME composition filling the
+    // empty sibling item a loose-item split just published. The empty marker
+    // row contributes zero visible characters, so the generic locally-aligned
+    // mapper drifts the insertion into the previous paragraph and the strict
+    // gate fail-closes (warning, source stops tracking). This owner fills the
+    // authored empty marker row byte-preservingly.
+    const listEmptyItemTextFillTransactionSourceSyncOwner =
+      createListEmptyItemTextFillTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const codeBlockParagraphTransactionSourceSyncOwner =
+      createCodeBlockParagraphTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    // Boundary join (0.13.193, trace-23324): Backspace at the start of a
+    // paragraph that neighbors a fenced code block merges the two nodes —
+    // the paragraph text joins the code block's last line (code-absorbs-
+    // paragraph) or vice versa. The legacy localized mapper is fence-blind
+    // and its 0.13.190 fence guard fail-closes this shape, so without this
+    // owner the source never syncs (stale ``` visible in source mode).
+    const codeBlockBoundaryJoinTransactionSourceSyncOwner =
+      createCodeBlockBoundaryJoinTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const emptyCodeBlockUnpackTransactionSourceSyncOwner =
+      createEmptyCodeBlockUnpackTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const codeBlockExitTransactionSourceSyncOwner =
+      createCodeBlockExitTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const codeBlockTransactionSourceSyncOwner = createCodeBlockTransactionSourceSyncOwner({
+      resolveMarkdownOffset: resolveTransactionMarkdownOffset
+    })
+    const codeBlockInfoTransactionSourceSyncOwner = createCodeBlockInfoTransactionSourceSyncOwner({
+      resolveMarkdownOffset: resolveTransactionMarkdownOffset
+    })
+    // Cross-fence block-span replacement (P5c, trace-86199 12:37): selection
+    // deletes / undo restores spanning a fenced code block. The localized
+    // mappers' fence guard correctly refuses these, and the legacy fallback
+    // then holds a no-op — the committed source silently stops tracking the
+    // editor. This owner replaces the whole changed top-level window
+    // (table-free spans only; 1:1 code content edits stay with the code
+    // family above) using the P7 style-following serializer.
+    const crossFenceSpanTransactionSourceSyncOwner =
+      createCrossFenceSpanTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        serializeNodes: (nodes) => {
+          const serializer = crepe.editor.ctx.get(serializerCtx)
+          const schema = nodes?.[0]?.type?.schema || viewRef.current?.state.schema
+          if (!serializer || !schema?.nodes?.doc) return null
+          return serializer(schema.nodes.doc.create(null, nodes))
+        },
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const blockquoteParagraphTransactionSourceSyncOwner =
+      createBlockquoteParagraphTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const blockquoteSplitTransactionSourceSyncOwner =
+      createBlockquoteSplitTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const blockquoteJoinTransactionSourceSyncOwner =
+      createBlockquoteJoinTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const blockquoteExitTransactionSourceSyncOwner =
+      createBlockquoteExitTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const tableCellTransactionSourceSyncOwner =
+      createTableCellTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const tableColumnAlignmentTransactionSourceSyncOwner =
+      createTableColumnAlignmentTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const tableColumnDeleteTransactionSourceSyncOwner =
+      createTableColumnDeleteTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const tableColumnInsertTransactionSourceSyncOwner =
+      createTableColumnInsertTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const tableColumnWidthTransactionSourceSyncOwner =
+      createTableColumnWidthTransactionSourceSyncOwner({
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const tableRowDeleteTransactionSourceSyncOwner =
+      createTableRowDeleteTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const topLevelBlockRemovalTransactionSourceSyncOwner =
+      createTopLevelBlockRemovalTransactionSourceSyncOwner({
+        parseMarkdownTree: (markdown) => crepe.editor.ctx.get(remarkCtx).parse(markdown),
+        serializeCanonical: (doc) => canonicalForSource(crepe.editor.ctx.get(serializerCtx)(doc)),
+        preserveTextEdit: preserveRichMarkdownSource,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const tableRowInsertTransactionSourceSyncOwner =
+      createTableRowInsertTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    // Structural families share one revision-bound journal and one publication
+    // loop. Adding quote/table ownership means registering another focused owner
+    // here, not adding a new markdownUpdated/forced-flush canonical branch.
+    // Narrow focused family for pending-text chains that end in ONE terminal
+    // top-level split (0.13.170 16:38:54: IME commit + immediate Enter). Pure
+    // text journals never match it, so existing paragraph authority paths are
+    // untouched. Declared before the registry below, which dispatches it.
+    const plainParagraphSplitTransactionSourceSyncOwner =
+      createPlainParagraphTransactionSourceSyncOwner({
+        requireTerminalSplit: true,
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const structuralTransactionSourceSyncOwners = Object.freeze([
+      Object.freeze({
+        key: 'list-nested-empty-bullet-tail-indent',
+        owner: listNestedEmptyBulletTailIndentTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedEmptyBulletTailIndentTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-empty-bullet-tail-indent-markdown-updated',
+          'forced-flush': 'transaction-list-nested-empty-bullet-tail-indent-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-nested-nonempty-bullet-indent',
+        owner: listNestedNonemptyBulletIndentTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedNonemptyBulletIndentTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-nonempty-bullet-indent-markdown-updated',
+          'forced-flush': 'transaction-list-nested-nonempty-bullet-indent-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-nested-single-child-bullet-outdent',
+        owner: listNestedSingleChildBulletOutdentTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedSingleChildBulletOutdentTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-single-child-bullet-outdent-markdown-updated',
+          'forced-flush': 'transaction-list-nested-single-child-bullet-outdent-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-nested-last-child-bullet-outdent',
+        owner: listNestedLastChildBulletOutdentTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedLastChildBulletOutdentTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-last-child-bullet-outdent-markdown-updated',
+          'forced-flush': 'transaction-list-nested-last-child-bullet-outdent-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-nested-first-child-bullet-outdent',
+        owner: listNestedFirstChildBulletOutdentTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedFirstChildBulletOutdentTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-first-child-bullet-outdent-markdown-updated',
+          'forced-flush': 'transaction-list-nested-first-child-bullet-outdent-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-nested-first-ordered-parent-join',
+        owner: listNestedFirstOrderedParentJoinTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedFirstOrderedParentJoinTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-first-ordered-parent-join-markdown-updated',
+          'forced-flush': 'transaction-list-nested-first-ordered-parent-join-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-nested-bullet-item-split',
+        owner: listNestedBulletSplitTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedBulletSplitTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-bullet-item-split-markdown-updated',
+          'forced-flush': 'transaction-list-nested-bullet-item-split-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-nested-bullet-item-join',
+        owner: listNestedBulletJoinTransactionSourceSyncOwner,
+        traceKey: '__hmListNestedBulletJoinTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-nested-bullet-item-join-markdown-updated',
+          'forced-flush': 'transaction-list-nested-bullet-item-join-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-task-checkbox-toggle',
+        owner: listTaskCheckboxToggleTransactionSourceSyncOwner,
+        traceKey: '__hmListTaskCheckboxToggleTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-task-checkbox-toggle-markdown-updated',
+          'forced-flush': 'transaction-list-task-checkbox-toggle-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-task-empty-sibling-split',
+        owner: listTaskEmptySiblingSplitTransactionSourceSyncOwner,
+        traceKey: '__hmListTaskEmptySiblingSplitTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-task-empty-sibling-split-markdown-updated',
+          'forced-flush': 'transaction-list-task-empty-sibling-split-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-ordered-empty-successor-chain-lift',
+        owner: listOrderedEmptySuccessorChainTransactionSourceSyncOwner,
+        traceKey: '__hmListOrderedEmptySuccessorChainTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-ordered-empty-successor-chain-lift-markdown-updated',
+          'forced-flush': 'transaction-list-ordered-empty-successor-chain-lift-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-ordered-empty-successor-lift',
+        owner: listOrderedEmptySuccessorLiftTransactionSourceSyncOwner,
+        traceKey: '__hmListOrderedEmptySuccessorLiftTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-ordered-empty-successor-lift-markdown-updated',
+          'forced-flush': 'transaction-list-ordered-empty-successor-lift-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-isolated-empty-ordered-lift',
+        owner: listIsolatedEmptyOrderedLiftTransactionSourceSyncOwner,
+        traceKey: '__hmListIsolatedEmptyOrderedLiftTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-isolated-empty-ordered-lift-markdown-updated',
+          'forced-flush': 'transaction-list-isolated-empty-ordered-lift-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-empty-item-first-lift',
+        owner: listEmptyItemFirstLiftTransactionSourceSyncOwner,
+        traceKey: '__hmListEmptyItemFirstTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-empty-item-first-lift-markdown-updated',
+          'forced-flush': 'transaction-list-empty-item-first-lift-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-empty-item-tail-remove',
+        owner: listEmptyItemTailRemoveTransactionSourceSyncOwner,
+        traceKey: '__hmListEmptyItemTailTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-empty-item-tail-remove-markdown-updated',
+          'forced-flush': 'transaction-list-empty-item-tail-remove-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-empty-item-remove',
+        owner: listEmptyItemRemoveTransactionSourceSyncOwner,
+        traceKey: '__hmListEmptyItemTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-empty-item-remove-markdown-updated',
+          'forced-flush': 'transaction-list-empty-item-remove-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-empty-item-text-filled',
+        owner: listEmptyItemTextFillTransactionSourceSyncOwner,
+        traceKey: '__hmListEmptyItemTextFillTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-empty-item-text-filled-markdown-updated',
+          'forced-flush': 'transaction-list-empty-item-text-filled-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-subtree',
+        owner: listSubtreeTransactionSourceSyncOwner,
+        traceKey: '__hmListSubtreeTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-subtree-markdown-updated',
+          'forced-flush': 'transaction-list-subtree-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'list-item-paragraph',
+        owner: listItemParagraphTransactionSourceSyncOwner,
+        traceKey: '__hmListItemTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-list-item-paragraph-markdown-updated',
+          'forced-flush': 'transaction-list-item-paragraph-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'code-block-boundary-join',
+        owner: codeBlockBoundaryJoinTransactionSourceSyncOwner,
+        traceKey: '__hmCodeBlockTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-code-block-boundary-join-markdown-updated',
+          'forced-flush': 'transaction-code-block-boundary-join-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'code-block-paragraph',
+        owner: codeBlockParagraphTransactionSourceSyncOwner,
+        traceKey: '__hmCodeBlockTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-code-block-to-paragraph-markdown-updated',
+          'forced-flush': 'transaction-code-block-to-paragraph-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'empty-code-block-unpack',
+        owner: emptyCodeBlockUnpackTransactionSourceSyncOwner,
+        traceKey: '__hmCodeBlockTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-empty-code-block-unpack-markdown-updated',
+          'forced-flush': 'transaction-empty-code-block-unpack-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'code-block-exit',
+        owner: codeBlockExitTransactionSourceSyncOwner,
+        traceKey: '__hmCodeBlockTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-code-block-exit-markdown-updated',
+          'forced-flush': 'transaction-code-block-exit-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'code-block',
+        owner: codeBlockTransactionSourceSyncOwner,
+        traceKey: '__hmCodeBlockTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-code-block-markdown-updated',
+          'forced-flush': 'transaction-code-block-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'code-block-info',
+        owner: codeBlockInfoTransactionSourceSyncOwner,
+        traceKey: '__hmCodeBlockTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-code-block-info-markdown-updated',
+          'forced-flush': 'transaction-code-block-info-forced-flush'
+        })
+      }),
+      // Broad span owner — registered AFTER the whole focused code-block
+      // family so their tighter shapes get first claim (especially the 1:1
+      // code content edit this owner explicitly declines).
+      Object.freeze({
+        key: 'cross-fence-span',
+        owner: crossFenceSpanTransactionSourceSyncOwner,
+        traceKey: '__hmCrossFenceSpanTransactionTrace',
+        legacyRetired: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-cross-fence-span-markdown-updated',
+          'forced-flush': 'transaction-cross-fence-span-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'plain-paragraph-split',
+        owner: plainParagraphSplitTransactionSourceSyncOwner,
+        traceKey: '__hmPlainParagraphTransactionTrace',
+        generatedScratchEligible: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-plain-paragraph-split-markdown-updated',
+          'forced-flush': 'transaction-plain-paragraph-split-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'blockquote-paragraph',
+        owner: blockquoteParagraphTransactionSourceSyncOwner,
+        traceKey: '__hmBlockquoteTransactionTrace',
+        legacyRetired: true,
+        generatedScratchEligible: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-blockquote-paragraph-markdown-updated',
+          'forced-flush': 'transaction-blockquote-paragraph-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'blockquote-split',
+        owner: blockquoteSplitTransactionSourceSyncOwner,
+        traceKey: '__hmBlockquoteTransactionTrace',
+        legacyRetired: true,
+        generatedScratchEligible: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-blockquote-split-markdown-updated',
+          'forced-flush': 'transaction-blockquote-split-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'blockquote-join',
+        owner: blockquoteJoinTransactionSourceSyncOwner,
+        traceKey: '__hmBlockquoteTransactionTrace',
+        legacyRetired: true,
+        generatedScratchEligible: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-blockquote-join-markdown-updated',
+          'forced-flush': 'transaction-blockquote-join-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'blockquote-exit',
+        owner: blockquoteExitTransactionSourceSyncOwner,
+        traceKey: '__hmBlockquoteTransactionTrace',
+        legacyRetired: true,
+        generatedScratchEligible: true,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-blockquote-exit-markdown-updated',
+          'forced-flush': 'transaction-blockquote-exit-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'table-cell',
+        owner: tableCellTransactionSourceSyncOwner,
+        traceKey: '__hmTableTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-table-cell-markdown-updated',
+          'forced-flush': 'transaction-table-cell-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'table-column-width',
+        owner: tableColumnWidthTransactionSourceSyncOwner,
+        traceKey: '__hmTableTransactionTrace',
+        notifyChange: false,
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-table-column-width-markdown-updated',
+          'forced-flush': 'transaction-table-column-width-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'table-column-alignment',
+        owner: tableColumnAlignmentTransactionSourceSyncOwner,
+        traceKey: '__hmTableTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-table-column-alignment-markdown-updated',
+          'forced-flush': 'transaction-table-column-alignment-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'table-column-delete',
+        owner: tableColumnDeleteTransactionSourceSyncOwner,
+        traceKey: '__hmTableTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-table-column-delete-markdown-updated',
+          'forced-flush': 'transaction-table-column-delete-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'table-column-insert',
+        owner: tableColumnInsertTransactionSourceSyncOwner,
+        traceKey: '__hmTableTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-table-column-insert-markdown-updated',
+          'forced-flush': 'transaction-table-column-insert-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'table-row-delete',
+        owner: tableRowDeleteTransactionSourceSyncOwner,
+        traceKey: '__hmTableTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-table-row-delete-markdown-updated',
+          'forced-flush': 'transaction-table-row-delete-forced-flush'
+        })
+      }),
+      Object.freeze({
+        key: 'table-row-insert',
+        owner: tableRowInsertTransactionSourceSyncOwner,
+        traceKey: '__hmTableTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-table-row-insert-markdown-updated',
+          'forced-flush': 'transaction-table-row-insert-forced-flush'
+        })
+      }),
+      // Last: focused block owners above take precedence; legacy stays the
+      // fallback when this one rejects (not retired).
+      Object.freeze({
+        key: 'top-level-block-removal',
+        owner: topLevelBlockRemovalTransactionSourceSyncOwner,
+        traceKey: '__hmTopLevelBlockRemovalTransactionTrace',
+        boundaries: Object.freeze({
+          'markdown-updated': 'transaction-top-level-block-removal-markdown-updated',
+          'forced-flush': 'transaction-top-level-block-removal-forced-flush'
+        })
+      })
+    ])
+    // A user-test session launched with `--horsemd-input-trace` keeps the
+    // in-page evidence arrays alive from the start, so a reported
+    // first-divergence can be read back (CDP attach, or the on-warning dump
+    // below) instead of requiring a fresh instrumented repro. Normal builds
+    // never initialize these arrays; every consumer stays push-only.
+    if (window.api?.inputTraceEnabled === true) {
+      for (const key of [
+        '__hmPreserveLog',
+        '__hmSourceIntegrityTrace',
+        '__hmSourceIntegrityDiffTrace',
+        '__hmSourceSyncCoordinatorTrace',
+        '__hmSourceSyncTransactionJournalTrace',
+        '__hmFlushTrace',
+        '__hmSourceReprintTrace',
+        ...new Set(structuralTransactionSourceSyncOwners.map((entry) => entry.traceKey))
+      ]) {
+        if (!Array.isArray(globalThis[key])) globalThis[key] = []
+      }
+    }
+    const plainParagraphTransactionSourceSyncOwner =
+      createPlainParagraphTransactionSourceSyncOwner({
+        resolveMarkdownOffset: resolveTransactionMarkdownOffset,
+        validateMarkdown: validateTransactionMarkdown
+      })
+    const transactionFirstMode = () => {
+      if (globalThis.__hmTransactionFirstAuthority === true) return 'authoritative'
+      if (
+        globalThis.__hmTransactionSourceShadow === true ||
+        import.meta.env?.VITE_HM_TRANSACTION_SHADOW === '1'
+      ) return 'shadow'
+      return 'disabled'
+    }
+    const handleSlashCommand = ({ phase, id, view, token }) => {
+      if (phase === 'before') {
+        if (!slashBlockSourceSyncOwner.handles(id)) return null
+        try {
+          const serializer = crepe.editor.ctx.get(serializerCtx)
+          const remark = crepe.editor.ctx.get(remarkCtx)
+          const canonical = canonicalForSource(serializer(view.state.doc))
+          const captured = slashBlockSourceSyncOwner.capture({
+            id,
+            source: lastMarkdownRef.current,
+            previousCanonical: canonicalMarkdownRef.current,
+            canonical,
+            queryText: view.state.selection.$from.parent.textContent,
+            resolveSourceOffset: ({ source }) => pmPosToMarkdownOffset(
+              source,
+              view.state.selection.head,
+              view.state.doc,
+              remark
+            )
+          })
+          if (!captured.ok) {
+            pendingSlashBlockIntent = null
+            return null
+          }
+          pendingSlashBlockIntent = captured.token
+          markUserEdit()
+          return pendingSlashBlockIntent
+        } catch {
+          pendingSlashBlockIntent = null
+          return null
+        }
+      }
+      if (phase !== 'after' || !token || pendingSlashBlockIntent !== token) return null
+      try {
+        const serializer = crepe.editor.ctx.get(serializerCtx)
+        const canonical = canonicalForSource(serializer(view.state.doc))
+        const codeBlock = findSlashCodeBlockAtSelection(view.state.selection)
+        if (!codeBlock) return null
+        const singleBlockDoc = view.state.schema.topNodeType.create(null, [codeBlock])
+        const blockMarkdown = canonicalForSource(serializer(singleBlockDoc))
+        const planned = slashBlockSourceSyncOwner.plan({
+          id,
+          token,
+          activeToken: pendingSlashBlockIntent,
+          blockMarkdown,
+          canonical,
+          expectedDoc: view.state.doc
+        })
+        if (!planned.ok) return null
+        const coordinated = sourceSyncBridge.publish(planned.publication)
+        if (!coordinated?.ok) {
+          userEditUntil = Date.now() + 1000
+          return null
+        }
+        transactionSourcePendingPublish = false
+        transactionSourcePendingDoc = null
+        transactionSourceBlockHints = []
+        transactionSourceQuarantined = false
+        pendingSourceSyncTransactionJournal = null
+        clearRichFlushPending()
+        if (Array.isArray(globalThis.__hmPreserveLog)) {
+          globalThis.__hmPreserveLog.push({
+            source: token.source,
+            previous: token.previousCanonical,
+            next: canonical,
+            markdown: coordinated.publication.markdown,
+            preserved: true,
+            reason: planned.result.reason
+          })
+        }
+        return coordinated.publication.markdown
+      } catch {
+        return null
+      } finally {
+        if (pendingSlashBlockIntent === token) pendingSlashBlockIntent = null
+      }
+    }
+
+    const traceSourceTransactions = createEditorTransactionTracer()
+    const handleSourceTransactions = (transactions, oldState, newState) => {
+      traceSourceTransactions(transactions, oldState?.doc, newState?.doc)
+      // Keep a captured list-input anchor attached to its ProseMirror block
+      // even when markdownUpdated is deferred and the user has already moved
+      // on to another block. Looking only at the *current* selection loses the
+      // authored `-` / `+` / `1.` intent and lets the serializer's default
+      // marker enter source. Every transaction mapping is ordered from the
+      // previous document to the next, so map the anchor through the complete
+      // batch before any source-sync path returns.
+      const intents = new Set([
+        ...pendingMarkdownInputIntents,
+        ...(pendingMarkdownInputIntent ? [pendingMarkdownInputIntent] : [])
+      ])
+      for (const transaction of transactions || []) {
+        if (!transaction?.mapping?.map) continue
+        for (const intent of intents) {
+          if (!Number.isFinite(intent?.pmPos)) continue
+          intent.pmPos = transaction.mapping.map(intent.pmPos, 1)
+        }
+      }
+      const pendingRawPaste = pendingRawMarkdownPasteRef.current
+      const traceRawPasteOwner = (entry) => {
+        if (!Array.isArray(globalThis.__hmSourceSyncCoordinatorTrace)) return
+        globalThis.__hmSourceSyncCoordinatorTrace.push({
+          phase: 'raw-paste-transaction-owner',
+          ...entry
+        })
+      }
+      let rawPasteBound = false
+      if (pendingRawPaste && !pendingRawPaste.transactionBound) {
+        const bound = documentReplacementSourceSyncOwner.bindRawMarkdownPasteTransaction({
+          token: pendingRawPaste,
+          activeToken: pendingRawMarkdownPasteRef.current,
+          transactions,
+          oldDoc: oldState?.doc,
+          newDoc: newState?.doc
+        })
+        rawPasteBound = bound.ok === true
+        traceRawPasteOwner({
+          stage: 'bind',
+          ok: bound.ok === true,
+          reason: bound.reason || null,
+          transactionCount: (transactions || []).filter((transaction) => transaction?.docChanged).length,
+          tokenId: pendingRawPaste.tokenId || null
+        })
+      }
+      // Undoing the replacement before markdownUpdated returns the live
+      // document to its byte-owning baseline; do not regenerate that baseline.
+      if (
+        wholeDocumentReplacementPending?.originalDoc?.eq?.(newState?.doc) === true
+      ) {
+        wholeDocumentReplacementPending = null
+      }
+      // A selection that covered the complete pre-transaction document owns
+      // the complete replacement. Capture this before the optional transaction
+      // shadow gate: release builds need the explicit select-all path, while
+      // ordinary per-keystroke mapping remains opt-in.
+      if (
+        ready &&
+        !appending &&
+        !programmaticReplaceRef.current &&
+        hasRecentUserEdit() &&
+        isWholeDocumentReplacementBatch({ transactions, oldState, newState })
+      ) {
+        const captured = documentReplacementSourceSyncOwner.captureWholeDocumentReplacement({
+          source: lastMarkdownRef.current,
+          canonical: canonicalMarkdownRef.current,
+          originalDoc: oldState.doc,
+          expectedDoc: newState.doc
+        })
+        wholeDocumentReplacementPending = captured.ok ? captured.token : null
+        pendingSourceSyncTransactionJournal = null
+        pendingMarkdownInputIntent = null
+        pendingMarkdownInputIntents = []
+      }
+
+      // Raw Markdown paste owns exact clipboard bytes. Milkdown can defer its
+      // markdownUpdated callback beyond a source-mode/save boundary, so waiting
+      // for that callback lets forced flush publish canonical marker spelling
+      // (`*`) before the clipboard owner (`-`) is considered. Once the paste
+      // transaction chain is proven, serialize its resulting doc and commit the
+      // exact source immediately through the same Coordinator. If serialization
+      // or validation is transiently unavailable, keep the token for the normal
+      // callback fallback instead of advancing any baseline.
+      if (rawPasteBound && pendingRawMarkdownPasteRef.current === pendingRawPaste) {
+        try {
+          const serializer = crepe.editor.ctx.get(serializerCtx)
+          const canonical = canonicalForSource(serializer(newState.doc))
+          const ownership = documentReplacementSourceSyncOwner.planRawMarkdownPaste({
+            token: pendingRawPaste,
+            activeToken: pendingRawMarkdownPasteRef.current,
+            currentSource: lastMarkdownRef.current,
+            currentCanonical: canonicalMarkdownRef.current,
+            canonical,
+            expectedDoc: newState.doc
+          })
+          traceRawPasteOwner({
+            stage: 'plan',
+            ok: ownership.ok === true,
+            reason: ownership.reason || null,
+            tokenId: pendingRawPaste.tokenId || null,
+            canonicalLength: canonical.length,
+            markdownLength: pendingRawPaste.markdown?.length ?? null
+          })
+          if (ownership.ok) {
+            let coordinated
+            dispatchingExpectedDoc = newState.doc
+            try {
+              coordinated = sourceSyncBridge.publishOwned({ ownership })
+            } finally {
+              dispatchingExpectedDoc = null
+            }
+            traceRawPasteOwner({
+              stage: 'publish',
+              ok: coordinated?.ok === true,
+              reason: coordinated?.reason || null,
+              tokenId: pendingRawPaste.tokenId || null,
+              revision: coordinated?.snapshot?.revision ?? null
+            })
+            if (coordinated?.ok) {
+              pendingRawMarkdownPasteRef.current = null
+              wholeDocumentReplacementPending = null
+              transactionSourcePendingPublish = false
+              transactionSourcePendingDoc = null
+              transactionSourceBlockHints = []
+              transactionSourceQuarantined = false
+              pendingSourceSyncTransactionJournal = null
+              clearRichFlushPending()
+              userEditUntil = Date.now() + 1000
+              return
+            }
+          }
+        } catch (error) {
+          traceRawPasteOwner({
+            stage: 'exception',
+            ok: false,
+            reason: error?.message || error?.name || 'unknown',
+            tokenId: pendingRawPaste.tokenId || null
+          })
+          // Deferred markdownUpdated retains the same token and remains the
+          // fail-closed retry path; no source/canonical checkpoint was advanced.
+        }
+      }
+
+      // A Coordinator snapshot whose doc IS the pre-transaction doc is a proven
+      // (doc, source) pair; remember it so undo/redo back to this document can
+      // restore its exact bytes (identity check only — no per-keystroke eq).
+      // Only once ready: the Coordinator is created lazily on first access and
+      // must not snapshot the pre-bootstrap canonical.
+      if (ready) {
+        const snapshot = sourceSyncBridge.getSnapshot()
+        if (
+          snapshot.doc === oldState?.doc &&
+          snapshot.source === String(lastMarkdownRef.current ?? '') &&
+          snapshot.canonical === String(canonicalMarkdownRef.current ?? '')
+        ) {
+          sourceSnapshotHistory.record({ doc: snapshot.doc, source: snapshot.source })
+        }
+      }
+      // Undo/redo that lands on a recorded document (typically across a
+      // source-mode replacement, fuzz seeds 28/36) restores that document's
+      // exact source instead of extending the journal with a whole-document
+      // step no focused owner or legacy mapper can localize.
+      if (
+        ready &&
+        !viewRef.current?.composing &&
+        !appending &&
+        !programmaticReplaceRef.current &&
+        !pendingRawMarkdownPasteRef.current &&
+        !pendingListConversion &&
+        isHistoryTransactionBatch(transactions)
+      ) {
+        let restore = null
+        let coordinated = null
+        try {
+          const serializer = crepe.editor.ctx.get(serializerCtx)
+          restore = planHistorySourceRestore({
+            history: sourceSnapshotHistory,
+            transactions,
+            newDoc: newState.doc,
+            currentSource: lastMarkdownRef.current,
+            currentCanonical: canonicalMarkdownRef.current,
+            canonical: canonicalForSource(serializer(newState.doc))
+          })
+          if (restore.ok) {
+            dispatchingExpectedDoc = newState.doc
+            try {
+              coordinated = sourceSyncBridge.publishOwned({ ownership: restore })
+            } finally {
+              dispatchingExpectedDoc = null
+            }
+          }
+        } catch (error) {
+          restore = { ok: false, reason: error?.message || 'history-restore-exception' }
+        }
+        if (Array.isArray(globalThis.__hmSourceSyncTransactionJournalTrace)) {
+          globalThis.__hmSourceSyncTransactionJournalTrace.push({
+            phase: 'history-restore',
+            ok: coordinated?.ok === true,
+            reason: coordinated?.reason || restore?.reason || null,
+            revision: coordinated?.snapshot?.revision ?? null
+          })
+        }
+        if (coordinated?.ok) {
+          wholeDocumentReplacementPending = null
+          transactionSourcePendingPublish = false
+          transactionSourcePendingDoc = null
+          transactionSourceBlockHints = []
+          transactionSourceQuarantined = false
+          pendingSourceSyncTransactionJournal = null
+          pendingMarkdownInputIntent = null
+          pendingMarkdownInputIntents = []
+          clearRichFlushPending()
+          sourceSnapshotHistory.record({ doc: newState.doc, source: String(lastMarkdownRef.current ?? '') })
+          return
+        }
+      }
+
+      // Always-on, low-cost transaction journal. Dispatch stores immutable PM
+      // documents, steps and StepMaps against the exact Coordinator revision;
+      // Markdown range resolution waits for callback/forced flush. Structural
+      // follow-ups extend the same journal instead of publishing an intermediate
+      // empty-item representation or forcing each owner to invent a token.
+      // Journal capture is evidence-only: it never publishes Markdown here.
+      // Keep IME composition and generated-scratch transactions so a later
+      // focused owner can prove the complete chain after compositionend. The
+      // old blocking policy discarded exactly the ReplaceSteps needed to map
+      // rapid quote IME edits before Enter.
+      // Journal locality (0.13.235, fuzz seeds 33/36): every focused owner
+      // proves ONE top-level block. markUserEdit already flushes when the
+      // user's caret moves to another block, but it is driven by DOM input
+      // events — edits that bypass them (CodeMirror code blocks, some IME/undo
+      // paths) let the next edit elsewhere join the same journal, after which
+      // no owner and no legacy mapper can publish and the edit stays stranded
+      // until Save falls into the recovery prompt. Decide from the transaction
+      // itself: if it touches top-level blocks disjoint from what the pending
+      // journal changed, publish the pending journal first. dispatch calls us
+      // before view.updateState, so the forced flush sees exactly oldState.
+      // Heading-id sync (editor-only, see isHeadingIdOnlyChange): close the
+      // pending journal against oldState — the heading edit it carries is
+      // complete — then adopt the id change without a journal entry.
+      if (
+        ready &&
+        !viewRef.current?.composing &&
+        !appending &&
+        !programmaticReplaceRef.current &&
+        !pendingRawMarkdownPasteRef.current &&
+        !pendingListConversion &&
+        isHeadingIdOnlyChange(transactions, oldState.doc, newState.doc)
+      ) {
+        if (pendingSourceSyncTransactionJournal && !generatedScratchRef.current && !hasBlockingListInputIntent()) {
+          const markdown = apiRef.current?.flushMarkdown?.({ force: true })
+          if (typeof markdown === 'string') onChange?.(markdown, false)
+        }
+        if (
+          !pendingSourceSyncTransactionJournal &&
+          validateTransactionMarkdown({
+            markdown: String(lastMarkdownRef.current ?? ''),
+            expectedDoc: newState.doc
+          }) === true &&
+          sourceSyncBridge.adoptEditorOnlyDocument({ doc: newState.doc, reason: 'heading-id-sync' })
+        ) {
+          if (Array.isArray(globalThis.__hmSourceSyncTransactionJournalTrace)) {
+            globalThis.__hmSourceSyncTransactionJournalTrace.push({ phase: 'editor-only-adopted', ok: true, reason: 'heading-id-sync' })
+          }
+          return
+        }
+      }
+
+      if (
+        ready &&
+        pendingSourceSyncTransactionJournal &&
+        !viewRef.current?.composing &&
+        !appending &&
+        !programmaticReplaceRef.current &&
+        !generatedScratchRef.current &&
+        !pendingRawMarkdownPasteRef.current &&
+        !pendingListConversion &&
+        !hasBlockingListInputIntent()
+      ) {
+        const journalRange = changedTopLevelRange(pendingSourceSyncTransactionJournal.oldDoc, oldState.doc)
+        const transactionRange = transactionTopLevelRange(transactions, oldState.doc)
+        if (
+          journalRange &&
+          transactionRange &&
+          (transactionRange.to < journalRange.from || transactionRange.from > journalRange.to)
+        ) {
+          const markdown = apiRef.current?.flushMarkdown?.({ force: true })
+          if (typeof markdown === 'string') onChange?.(markdown, false)
+          // The transaction being dispatched is itself an unpublished edit.
+          richFlushPending = true
+          pendingRichBlockKey = null
+          if (Array.isArray(globalThis.__hmSourceSyncTransactionJournalTrace)) {
+            globalThis.__hmSourceSyncTransactionJournalTrace.push({
+              phase: 'locality-flush',
+              ok: typeof markdown === 'string',
+              journalRange,
+              transactionRange
+            })
+          }
+        }
+      }
+
+      const transactionJournalCaptureContext = {
+        generatedScratch: Boolean(generatedScratchRef.current),
+        composing: Boolean(viewRef.current?.composing)
+      }
+      const transactionJournalBlockState = {
+        notReady: !ready,
+        appending: Boolean(appending),
+        programmaticReplace: Boolean(programmaticReplaceRef.current),
+        rawPaste: Boolean(pendingRawMarkdownPasteRef.current),
+        listConversion: Boolean(pendingListConversion),
+        listInputIntent: hasBlockingListInputIntent(),
+        wholeDocumentReplacement: Boolean(wholeDocumentReplacementPending),
+        quarantined: Boolean(transactionSourceQuarantined),
+        recentUserEditMissing: !hasRecentUserEdit()
+      }
+      const transactionJournalTrackingBlocked = Object.values(transactionJournalBlockState).some(Boolean)
+      if (transactionJournalTrackingBlocked) {
+        pendingSourceSyncTransactionJournal = null
+        if (Array.isArray(globalThis.__hmSourceSyncTransactionJournalTrace)) {
+          globalThis.__hmSourceSyncTransactionJournalTrace.push({
+            phase: 'blocked',
+            ok: false,
+            reason: 'transaction-journal-tracking-blocked',
+            blockers: transactionJournalBlockState,
+            transactionCount: transactions.length,
+            stepCount: transactions.reduce(
+              (total, transaction) => total + (transaction.steps?.length || 0),
+              0
+            )
+          })
+          if (globalThis.__hmSourceSyncTransactionJournalTrace.length > 100) {
+            globalThis.__hmSourceSyncTransactionJournalTrace.shift()
+          }
+        }
+      } else {
+        try {
+          let snapshot = sourceSyncBridge.getSnapshot()
+          const liveSnapshotMatched =
+            snapshot.source === String(lastMarkdownRef.current ?? '') &&
+            snapshot.canonical === String(canonicalMarkdownRef.current ?? '')
+          // Milkdown's trailing plugin appends an empty paragraph after a
+          // final table/list/code/quote (typically on the first click). It has
+          // no Markdown encoding, so adopt it as an editor-only document change
+          // instead of letting it become the first step of the user's next
+          // journal — there it made every focused owner see two top-level
+          // changes and fall through to the legacy guess (fuzz 2026-10-02:
+          // table at EOF, a typed space produced a broken-table candidate).
+          if (
+            liveSnapshotMatched &&
+            !pendingSourceSyncTransactionJournal &&
+            isTrailingEmptyParagraphAppend(transactions, oldState.doc, newState.doc) &&
+            validateTransactionMarkdown({
+              markdown: String(lastMarkdownRef.current ?? ''),
+              expectedDoc: newState.doc
+            }) === true
+          ) {
+            const adopted = sourceSyncBridge.adoptEditorOnlyDocument({
+              doc: newState.doc,
+              reason: 'trailing-empty-paragraph-append'
+            })
+            if (adopted && Array.isArray(globalThis.__hmSourceSyncTransactionJournalTrace)) {
+              globalThis.__hmSourceSyncTransactionJournalTrace.push({
+                phase: 'editor-only-adopted',
+                ok: true,
+                reason: 'trailing-empty-paragraph-append',
+                revision: adopted.revision
+              })
+            }
+            if (adopted) return
+            snapshot = sourceSyncBridge.getSnapshot()
+          }
+          const captured = liveSnapshotMatched
+            ? sourceSyncTransactionJournal.captureOrAdvance({
+                checkpoint: pendingSourceSyncTransactionJournal,
+                snapshot,
+                transactions,
+                oldDoc: oldState.doc,
+                newDoc: newState.doc
+              })
+            : {
+                ok: false,
+                reset: true,
+                reason: 'transaction-journal-live-snapshot-stale'
+              }
+          if (captured.ok) {
+            pendingSourceSyncTransactionJournal = captured.checkpoint
+          } else if (captured.reset) {
+            pendingSourceSyncTransactionJournal = null
+          }
+          if (Array.isArray(globalThis.__hmSourceSyncTransactionJournalTrace)) {
+            globalThis.__hmSourceSyncTransactionJournalTrace.push({
+              phase: 'capture',
+              ok: captured.ok === true,
+              reason: captured.reason || null,
+              journalId: captured.checkpoint?.journalId || null,
+              baseRevision: captured.checkpoint?.baseRevision ?? null,
+              batchCount: captured.checkpoint?.batchCount || null,
+              transactionCount: captured.checkpoint?.transactionCount || null,
+              stepCount: captured.checkpoint?.stepCount || null,
+              stepDetails: captured.checkpoint?.stepDetails || [],
+              generatedScratch: transactionJournalCaptureContext.generatedScratch,
+              composing: transactionJournalCaptureContext.composing
+            })
+            if (globalThis.__hmSourceSyncTransactionJournalTrace.length > 100) {
+              globalThis.__hmSourceSyncTransactionJournalTrace.shift()
+            }
+          }
+        } catch {
+          pendingSourceSyncTransactionJournal = null
+        }
+      }
+
+      // The shared journal above is the only production lifecycle for shadow
+      // and allowlisted transaction authority. Keep the historical broad
+      // transaction-primary mapper behind its explicit test/dev gate until its
+      // remaining families migrate to focused journal consumers.
+      const transactionPrimaryEnabled =
+        globalThis.__hmTransactionSourcePrimary === true ||
+        import.meta.env?.VITE_HM_TRANSACTION_PRIMARY === '1'
+      if (!transactionPrimaryEnabled) return
+      if (
+        !ready ||
+        appending ||
+        programmaticReplaceRef.current ||
+        generatedScratchRef.current ||
+        viewRef.current?.composing ||
+        pendingRawMarkdownPasteRef.current ||
+        pendingListConversion ||
+        hasBlockingListInputIntent() ||
+        transactionSourceQuarantined ||
+        !hasRecentUserEdit()
+      ) {
+        transactionSourcePendingPublish = false
+        transactionSourcePendingDoc = null
+        transactionSourceBlockHints = []
+        return
+      }
+      try {
+        const remark = crepe.editor.ctx.get(remarkCtx)
+        const parser = crepe.editor.ctx.get(parserCtx)
+        const mapped = mapPlainTextTransactionsToSource({
+          source: lastMarkdownRef.current,
+          transactions,
+          oldState,
+          newState,
+          blockHints: transactionSourceBlockHints,
+          mapPosition: (source, position, doc) =>
+            pmPosToMarkdownOffset(source, position, doc, remark),
+          validateMarkdown: (markdown, expectedDoc) => {
+            const parsed = parser(markdown)
+            const equal = areSourceDocumentsEquivalent(parsed, expectedDoc)
+            const serializer = crepe.editor.ctx.get(serializerCtx)
+            const expectedCanonical = canonicalForSource(serializer(expectedDoc))
+            const listSlotsMatch = areMarkdownListSlotsEquivalent(markdown, expectedCanonical, {
+              strictOrderedNumbers: true,
+              previousMarkdown: canonicalMarkdownRef.current
+            })
+            if ((!equal || !listSlotsMatch) && Array.isArray(globalThis.__hmSourceTransactionTrace)) {
+              globalThis.__hmSourceTransactionSemantic = {
+                parsed: parsed?.toJSON?.() || null,
+                expected: expectedDoc?.toJSON?.() || null
+              }
+            }
+            return equal && listSlotsMatch
+          }
+        })
+        if (!mapped.ok) {
+          if (!transactionPrimaryEnabled) return
+          transactionSourcePendingPublish = false
+          transactionSourcePendingDoc = null
+          const retainOwnedSyntaxSlot =
+            transactionSourceBlockHints.length > 0 &&
+            (mapped.reason === 'block-prefix-sensitive-insert' ||
+              mapped.reason === 'syntax-sensitive-insert')
+          if (!retainOwnedSyntaxSlot) transactionSourceBlockHints = []
+          transactionSourceQuarantined = true
+          return
+        }
+        // Run as a non-authoritative shadow in production until this edit
+        // category passes the complete family matrix. Targeted integration
+        // tests opt into primary mode and prove that eligible transactions can
+        // bypass canonical diff without silently widening production scope.
+        if (!transactionPrimaryEnabled) return
+
+        // The source bytes come only from the transaction mapper. Serialization
+        // is retained temporarily as a baseline fingerprint so delayed
+        // markdownUpdated callbacks and unsupported follow-up transactions can
+        // continue from the exact matching PM document without replaying the
+        // already-consumed text edit.
+        const serializer = crepe.editor.ctx.get(serializerCtx)
+        const canonical = canonicalForSource(serializer(newState.doc))
+        lastMarkdownRef.current = mapped.markdown
+        canonicalMarkdownRef.current = canonical
+        transactionSourceBlockHints = mapped.blockHints || []
+        transactionSourceQuarantined = false
+        transactionSourcePendingPublish = true
+        transactionSourcePendingDoc = newState.doc
+      } catch (error) {
+        // No partial state is committed by the mapper. Preserve a structural
+        // diagnostic without retaining document content, then quarantine the
+        // primary path until markdownUpdated establishes a safe checkpoint.
+        if (Array.isArray(globalThis.__hmSourceTransactionLog)) {
+          globalThis.__hmSourceTransactionLog.push({
+            ok: false,
+            reason: 'transaction-controller-threw',
+            error: error?.name || 'Error'
+          })
+        }
+        transactionSourcePendingPublish = false
+        transactionSourcePendingDoc = null
+        transactionSourceBlockHints = []
+        if (transactionPrimaryEnabled) transactionSourceQuarantined = true
+      }
+    }
+
+    crepe = createConfiguredCrepe({
+      host,
+      // Decide the code-block mount mode BEFORE Crepe parses: block-heavy
+      // documents (issue #126, 394-fence redis doc) must not eager-mount a
+      // CodeMirror per fence.
+      defaultValue: (() => {
+        const normalized = normalizeReviewMarkupMarkdown(normalizeDisplayMath(firstContent))
+        chooseCodeBlockMountMode(normalized)
+        return normalized
+      })(),
+      getT: (key) => tRef.current(key),
+      persistImage,
+      notify: fireToast,
+      copyText: copyToClipboard,
+      getInlineMathDeleteMode: () => inlineMathDeleteModeRef.current,
+      getMarkdownSyntax: () => markdownSyntaxRef.current || {},
+      markUserEdit,
+      isReadOnly: () => readOnlyRef.current,
+      onFrontmatterValueChange: handleFrontmatterValueChange,
+      onInlineCodeValueChange: handleInlineCodeValueChange,
+      onSlashCommand: handleSlashCommand,
+      onSourceTransactions: handleSourceTransactions
+    })
+    crepeRef.current = crepe
+    const serializerStyleHolder = createSerializerStyleHolder(firstContent)
+
+    // Keep a small exact set of source/canonical pairs that have already been
+    // proven or were created directly by opening the author's file. The store
+    // now lives behind the SourceSyncCoordinator contract, while all legacy
+    // validation rules and trace fields remain byte-for-byte compatible.
+    const sourceIntegrityCheckpoints = createSourceSyncCheckpointStore({ limit: 4 })
+    const validateSourceCandidate = createLegacySourceIntegrityValidator({
+      getParser: () => crepe.editor.ctx.get(parserCtx),
+      getSerializer: () => crepe.editor.ctx.get(serializerCtx),
+      getExpectedDoc: () => viewRef.current?.state.doc,
+      getAuthoredSource: () => lastMarkdownRef.current,
+      getCanonicalBaseline: () => canonicalMarkdownRef.current,
+      canonicalForSource,
+      checkpointStore: sourceIntegrityCheckpoints,
+      getTrace: () => globalThis.__hmSourceIntegrityTrace
+    })
+    let dispatchingExpectedDoc = null
+    // Source reprint shadow mode (R2, docs/source-reprint-architecture.md):
+    // under input trace only, compute what the reprint engine would publish at
+    // every publication and every refused sync, without affecting either.
+    // Blockquotes whose last child is the editor's empty paragraph (e.g. Enter
+    // out of a quoted list): no Markdown encoding, admitted by exact path.
+    const trailingEmptyQuotePaths = (doc) => {
+      const paths = []
+      const walk = (node, path) => {
+        if (node.type.name === 'blockquote' && node.childCount >= 2) {
+          const last = node.lastChild
+          if (last?.type.name === 'paragraph' && last.content.size === 0) paths.push(path)
+        }
+        node.forEach((child, _offset, index) => {
+          if (!child.isTextblock && !child.isLeaf) walk(child, [...path, index])
+        })
+      }
+      walk(doc, [])
+      return paths
+    }
+    const reprintDeps = () => ({
+      parse: (markdown) => crepe.editor.ctx.get(parserCtx)(markdown),
+      // Same as `parse`, from the mdast the engine already built.
+      parseTree: (tree) => {
+        const state = new ParserState(crepe.editor.ctx.get(schemaCtx))
+        state.next(tree)
+        return state.toDoc()
+      },
+      remark: crepe.editor.ctx.get(remarkCtx),
+      serialize: (node) => crepe.editor.ctx.get(serializerCtx)(node),
+      equivalent: (markdown, expectedDoc) => validateTransactionMarkdown({
+        markdown,
+        expectedDoc,
+        semanticOptions: {
+          ignoreTrailingEmptyBlockquoteParagraphPaths: trailingEmptyQuotePaths(expectedDoc),
+          ignoreAllTableColumnWidths: true,
+          ignoreEmptyContainerParagraphs: true,
+          relaxOrderedNumbers: true
+        }
+      }) === true
+    })
+    const shadowReprint = (phase, { previousSource, publishedMarkdown = null, doc }) => {
+      if (window.api?.inputTraceEnabled !== true || !doc || typeof previousSource !== 'string') return
+      if (!Array.isArray(globalThis.__hmSourceReprintShadowTrace)) globalThis.__hmSourceReprintShadowTrace = []
+      const started = performance.now()
+      if (!Array.isArray(globalThis.__hmSourceIntegrityDiffTrace)) globalThis.__hmSourceIntegrityDiffTrace = []
+      const diffMark = globalThis.__hmSourceIntegrityDiffTrace.length
+      let result
+      try {
+        result = reprintVerified({ ...reprintDeps(), source: previousSource, editorDoc: doc })
+      } catch (error) {
+        result = { ok: false, reason: `threw:${error?.message || error}` }
+      }
+      // First semantic difference of the engine's own verification (why it
+      // failed), for fuzz triage.
+      const engineDiff = !result.ok && globalThis.__hmSourceIntegrityDiffTrace.length > diffMark
+        ? globalThis.__hmSourceIntegrityDiffTrace[globalThis.__hmSourceIntegrityDiffTrace.length - 1]
+        : null
+      const sameAsCurrent = publishedMarkdown == null ? null : result.markdown === publishedMarkdown
+      globalThis.__hmSourceReprintShadowTrace.push({
+        phase,
+        at: Date.now(),
+        ok: result.ok === true,
+        verified: result.verified === true,
+        reason: result.reason || null,
+        sameAsCurrent,
+        levels: (result.notes || []).map((note) => note.level).filter(Boolean),
+        ms: Math.round(performance.now() - started),
+        ...(result.ok && sameAsCurrent === false
+          ? { previous: previousSource, current: publishedMarkdown, reprinted: result.markdown }
+          : {}),
+        ...(!result.ok ? {
+          previous: previousSource,
+          attempted: result.markdown ?? null,
+          engineDiff: engineDiff ? JSON.stringify(engineDiff).slice(0, 1500) : null,
+          notes: (result.notes || []).slice(0, 12)
+        } : {})
+      })
+      if (globalThis.__hmSourceReprintShadowTrace.length > 400) globalThis.__hmSourceReprintShadowTrace.shift()
+    }
+    // Source reprint as the PRIMARY publication path (R3,
+    // docs/source-reprint-architecture.md): the editor document is reprinted
+    // against the committed source, verified directly against that document,
+    // then published through the same Coordinator validation. Anything it
+    // cannot express returns null and the established owners/legacy path runs
+    // unchanged. `globalThis.__hmSourceReprintPrimary = false` disables it.
+    let publishingReprint = false
+    // Last document whose committed source a full flush check verified.
+    let verifiedLiveDoc = null
+    const publishReprint = ({ canonical, boundary, notifyChange = true, allowDegraded = false }) => {
+      if (globalThis.__hmSourceReprintPrimary === false) return null
+      if (generatedScratchRef.current || viewRef.current?.composing) return null
+      const doc = dispatchingExpectedDoc ?? viewRef.current?.state.doc
+      const source = String(lastMarkdownRef.current ?? '')
+      if (!doc || typeof canonical !== 'string') return null
+      let result
+      try {
+        // The editor document paired with `source` (Coordinator checkpoint):
+        // lets the engine see editor-only edits such as removing an empty line.
+        // (Only once ready: the Coordinator is created lazily on first access.)
+        const snapshot = ready ? sourceSyncBridge?.getSnapshot?.() : null
+        const previousDoc = snapshot?.source === source && snapshot.doc !== doc ? snapshot.doc : null
+        result = reprintVerified({ ...reprintDeps(), source, editorDoc: doc, previousDoc })
+      } catch {
+        return null
+      }
+      const trace = (entry) => {
+        if (!Array.isArray(globalThis.__hmSourceReprintTrace)) return
+        globalThis.__hmSourceReprintTrace.push({ boundary, ...entry })
+        if (globalThis.__hmSourceReprintTrace.length > 100) globalThis.__hmSourceReprintTrace.shift()
+      }
+      if (!result?.ok || !result.verified) {
+        trace({ phase: 'declined', reason: result?.reason || 'unverified' })
+        return null
+      }
+      // A degraded reprint (a text block printed whole because its character
+      // map failed) must not beat the established path's exact spelling; it
+      // is only the last resort before a pause.
+      if (result.degraded && !allowDegraded) {
+        trace({ phase: 'declined', reason: 'degraded' })
+        return null
+      }
+      // Nothing to write and nothing to advance: let the committed fast path
+      // run — except as the rescue, where that path has just failed and the
+      // verified unchanged source is the answer.
+      if (!allowDegraded && result.markdown === source && canonical === canonicalMarkdownRef.current) return null
+      const levels = (result.notes || []).map((note) => note.level).filter(Boolean)
+      const proof = Object.freeze({
+        kind: 'source-reprint-proof',
+        levels: Object.freeze(levels),
+        escape: result.escape,
+        trailingEmptyBlockquotePaths: trailingEmptyQuotePaths(doc)
+      })
+      const reprintResult = Object.freeze({
+        markdown: result.markdown,
+        preserved: true,
+        reason: 'source-reprint',
+        integrityProof: proof
+      })
+      const ownership = Object.freeze({
+        ok: true,
+        decision: 'owned',
+        owner: SOURCE_SYNC_OWNERS.TRANSACTION,
+        family: 'source-reprint',
+        boundary,
+        reason: 'source-reprint',
+        proof,
+        result: reprintResult,
+        canonical,
+        expectedDoc: doc
+      })
+      let coordinated = null
+      publishingReprint = true
+      try {
+        coordinated = sourceSyncBridge.publishOwned({ ownership, notifyChange, boundary })
+      } catch {
+        coordinated = null
+      } finally {
+        publishingReprint = false
+      }
+      trace({ phase: coordinated?.ok ? 'published' : 'rejected', reason: coordinated?.reason || null, levels })
+      if (!coordinated?.ok) return null
+      pendingSourceSyncTransactionJournal = null
+      wholeDocumentReplacementPending = null
+      transactionSourcePendingPublish = false
+      transactionSourcePendingDoc = null
+      transactionSourceBlockHints = []
+      transactionSourceQuarantined = false
+      return result.markdown
+    }
+    sourceSyncBridge = createEditorSourceSyncBridge({
+      checkpointStore: sourceIntegrityCheckpoints,
+      getSource: () => lastMarkdownRef.current,
+      getCanonical: () => canonicalMarkdownRef.current,
+      // During dispatch (handleSourceTransactions runs before
+      // view.updateState) a publication about the dispatched document must be
+      // checked against THAT document, not the still-old view state.
+      getExpectedDoc: () => dispatchingExpectedDoc ?? viewRef.current?.state.doc,
+      setSource: (markdown) => {
+        const previous = lastMarkdownRef.current
+        lastMarkdownRef.current = markdown
+        if (previous !== markdown && !publishingReprint) {
+          shadowReprint('publish', {
+            previousSource: previous,
+            publishedMarkdown: markdown,
+            doc: dispatchingExpectedDoc ?? viewRef.current?.state.doc
+          })
+        }
+      },
+      setCanonical: (canonical) => { canonicalMarkdownRef.current = canonical },
+      onChange: (markdown) => onChange?.(markdown, false),
+      validateLegacyCandidate: validateSourceCandidate,
+      trace: (entry) => {
+        if (!Array.isArray(globalThis.__hmSourceSyncCoordinatorTrace)) return
+        globalThis.__hmSourceSyncCoordinatorTrace.push(entry)
+        if (globalThis.__hmSourceSyncCoordinatorTrace.length > 100) {
+          globalThis.__hmSourceSyncCoordinatorTrace.shift()
+        }
+      }
+    })
+    const publishSourceSyncResult = (input) => {
+      const coordinated = sourceSyncBridge.publish(input)
+      if (coordinated?.ok) pendingSourceSyncTransactionJournal = null
+      return coordinated
+    }
+    let lastSourceSyncWarning = null
+    const reportSourceSyncFailure = (reason, { rescue = true } = {}) => {
+      // Last resort before pausing: the degraded source reprint, still
+      // verified directly against the editor document.
+      if (rescue) try {
+        const doc = viewRef.current?.state.doc
+        if (doc && !generatedScratchRef.current && !viewRef.current?.composing) {
+          const canonical = canonicalForSource(crepe.editor.ctx.get(serializerCtx)(doc))
+          const rescued = publishReprint({ canonical, boundary: 'source-reprint-rescue', notifyChange: true, allowDegraded: true })
+          if (rescued != null) {
+            clearRichFlushPending()
+            return true
+          }
+        }
+      } catch {
+        // fall through to the established failure handling
+      }
+      const now = Date.now()
+      const signature = String(reason || 'source-document-mismatch')
+      if (lastSourceSyncWarning?.signature === signature && now - lastSourceSyncWarning.at < 1500) return
+      lastSourceSyncWarning = { signature, at: now }
+      shadowReprint('failure', { previousSource: lastMarkdownRef.current, doc: viewRef.current?.state.doc })
+      traceEditorEvent('source-sync-integrity-failure', { reason: signature })
+      // Persist the in-page decision evidence next to the input log so a
+      // user-test divergence can be diagnosed after the app quits. Doc-shaped
+      // fields (parsed/expected/candidate) are dropped — digests, reasons,
+      // steps and proofs are what locate a first-divergence.
+      if (window.api?.inputTraceEnabled === true) {
+        const tail = (key, size) => (Array.isArray(globalThis[key]) ? globalThis[key].slice(-size) : [])
+        traceEditorEvent('source-sync-evidence-dump', {
+          reason: signature,
+          diff: tail('__hmSourceIntegrityDiffTrace', 6),
+          preserve: tail('__hmPreserveLog', 12).map(({ source, previous, next, markdown, ...entry }) => entry),
+          integrity: tail('__hmSourceIntegrityTrace', 12).map((entry) => ({
+            ok: entry?.ok,
+            semanticOk: entry?.semanticOk,
+            listSlotsMatch: entry?.listSlotsMatch,
+            preservationReason: entry?.preservationReason,
+            validationSite: entry?.validationSite,
+            candidateTail: String(entry?.candidate || '').slice(-300),
+            canonicalTail: String(entry?.canonical || '').slice(-300)
+          })),
+          coordinator: tail('__hmSourceSyncCoordinatorTrace', 12),
+          journal: tail('__hmSourceSyncTransactionJournalTrace', 12),
+          flush: tail('__hmFlushTrace', 8),
+          owners: Object.fromEntries(
+            [...new Set(structuralTransactionSourceSyncOwners.map((entry) => entry.traceKey))]
+              .map((key) => [key, tail(key, 12)])
+              .filter(([, entries]) => entries.length > 0)
+          )
+        })
+      }
+      fireToast(tRef.current('save.sourceSyncMismatch'), {
+        sticky: true,
+        action: syncReportAction(captureSyncReport(signature, 'edit'), tRef.current('syncReport.button'), tRef.current('syncReport.hint'))
+      })
+    }
+
+    const pushStructuralTransactionTrace = (entry, value) => {
+      const trace = globalThis[entry.traceKey]
+      if (!Array.isArray(trace)) return
+      trace.push(value)
+      if (trace.length > 100) trace.shift()
+    }
+
+    const publishPendingStructuralTransactionImpl = ({
+      canonical,
+      expectedDoc,
+      site = 'markdown-updated',
+      notifyChange
+    } = {}) => {
+      const journal = pendingSourceSyncTransactionJournal
+      if (!journal) return { attempted: false, ok: false }
+      const snapshot = sourceSyncBridge.getSnapshot()
+      let callbackDocumentEquivalent = false
+      try {
+        const parser = crepe.editor.ctx.get(parserCtx)
+        callbackDocumentEquivalent = Boolean(
+          expectedDoc && areSourceDocumentsEquivalent(parser(canonical), expectedDoc, {
+            recordDifference: false,
+            ...sourceSyncBridge.getSemanticOptions(expectedDoc)
+          })
+        )
+      } catch {
+        callbackDocumentEquivalent = false
+      }
+
+      let lastRejection = null
+      let heldRejection = null
+      for (const entry of structuralTransactionSourceSyncOwners) {
+        // A new/empty document still uses generated-scratch canonical fallback
+        // for unowned edits. Only explicitly reviewed focused owners may consume
+        // its journal; this preserves scratch behavior without discarding PM
+        // evidence or widening every migrated family at once.
+        if (generatedScratchRef.current && entry.generatedScratchEligible !== true) continue
+        const boundary = entry.boundaries[site] || `transaction-${entry.key}-${site}`
+        const ownership = entry.owner.plan({
+          journal,
+          activeJournal: pendingSourceSyncTransactionJournal,
+          snapshot,
+          currentSource: lastMarkdownRef.current,
+          currentCanonical: canonicalMarkdownRef.current,
+          canonical,
+          expectedDoc,
+          callbackDocumentEquivalent,
+          boundary
+        })
+        if (!ownership.ok) {
+          const legacyBlocked = blocksRetiredLegacySourceSyncFallback({
+            ownerEntry: entry,
+            ownership
+          })
+          pushStructuralTransactionTrace(entry, {
+            phase: 'plan',
+            ok: false,
+            family: entry.owner.family,
+            reason: ownership.reason || null,
+            proof: ownership.proof || null,
+            recognized: ownership.recognized === true,
+            legacyBlocked,
+            journalId: journal.journalId,
+            baseRevision: journal.baseRevision,
+            chainLength: journal.transactionCount
+          })
+          lastRejection = {
+            attempted: true,
+            ok: false,
+            deferred: ownership.deferred === true,
+            holdJournal: ownership.holdJournal === true,
+            recognized: ownership.recognized === true,
+            legacyBlocked,
+            reason: ownership.reason || null,
+            family: entry.owner.family,
+            proof: ownership.proof || null
+          }
+          if (ownership.holdJournal === true) heldRejection = lastRejection
+          // A stale revision/source/doc invalidates the shared journal for every
+          // family. Unrecognized rejection remains available to the next owner.
+          // A recognized family whose legacy branch is retired must fail closed.
+          if (ownership.reset) {
+            pendingSourceSyncTransactionJournal = null
+            return { ...lastRejection, reset: true }
+          }
+          if (legacyBlocked) return lastRejection
+          continue
+        }
+
+        const coordinated = sourceSyncBridge.publishOwned({
+          ownership,
+          notifyChange: entry.notifyChange === false ? false : notifyChange,
+          boundary
+        })
+        if (!coordinated?.ok) {
+          const legacyBlocked = entry.legacyRetired === true
+          pushStructuralTransactionTrace(entry, {
+            phase: 'publish',
+            ok: false,
+            family: ownership.family,
+            reason: coordinated?.reason || 'source-document-mismatch',
+            legacyBlocked,
+            journalId: journal.journalId,
+            baseRevision: journal.baseRevision,
+            chainLength: journal.transactionCount
+          })
+          return {
+            attempted: true,
+            ok: false,
+            legacyBlocked,
+            reason: coordinated?.reason || 'source-document-mismatch',
+            family: ownership.family
+          }
+        }
+
+        pendingSourceSyncTransactionJournal = null
+        if (Array.isArray(globalThis.__hmPreserveLog)) {
+          globalThis.__hmPreserveLog.push({
+            source: journal.source,
+            previous: journal.canonical,
+            next: canonical,
+            markdown: ownership.result.markdown,
+            preserved: true,
+            reason: ownership.result.reason,
+            integrityProof: ownership.proof
+          })
+          if (globalThis.__hmPreserveLog.length > 200) globalThis.__hmPreserveLog.shift()
+        }
+        pushStructuralTransactionTrace(entry, {
+          phase: 'published',
+          ok: true,
+          family: ownership.family,
+          reason: ownership.result.reason,
+          journalId: journal.journalId,
+          baseRevision: journal.baseRevision,
+          chainLength: journal.transactionCount,
+          revision: coordinated.snapshot?.revision ?? null,
+          boundary
+        })
+        return {
+          attempted: true,
+          ok: true,
+          markdown: ownership.result.markdown,
+          reason: ownership.result.reason,
+          family: ownership.family,
+          coordinated
+        }
+      }
+      return heldRejection || lastRejection || {
+        attempted: true,
+        ok: false,
+        reason: 'transaction-family-unowned'
+      }
+    }
+    const publishPendingStructuralTransaction = (options) =>
+      transactionMarkdownOffsets.run(() => publishPendingStructuralTransactionImpl(options))
+    const planPendingPlainParagraphTransaction = ({
+      canonical,
+      expectedDoc,
+      boundary
+    } = {}) => {
+      const journal = pendingSourceSyncTransactionJournal
+      if (!journal) return { attempted: false, ok: false, journal: null, ownership: null }
+      const snapshot = sourceSyncBridge.getSnapshot()
+      let callbackDocumentEquivalent = false
+      try {
+        const parser = crepe.editor.ctx.get(parserCtx)
+        callbackDocumentEquivalent = Boolean(
+          expectedDoc && areSourceDocumentsEquivalent(parser(canonical), expectedDoc, {
+            recordDifference: false,
+            ...sourceSyncBridge.getSemanticOptions(expectedDoc)
+          })
+        )
+      } catch {
+        callbackDocumentEquivalent = false
+      }
+      const ownership = plainParagraphTransactionSourceSyncOwner.plan({
+        journal,
+        activeJournal: pendingSourceSyncTransactionJournal,
+        snapshot,
+        currentSource: lastMarkdownRef.current,
+        currentCanonical: canonicalMarkdownRef.current,
+        canonical,
+        expectedDoc,
+        callbackDocumentEquivalent,
+        boundary
+      })
+      if (ownership.reset) pendingSourceSyncTransactionJournal = null
+      return {
+        attempted: true,
+        ok: ownership.ok === true,
+        journal,
+        snapshot,
+        ownership,
+        callbackDocumentEquivalent
+      }
+    }
+
+    const tracePlainParagraphTransaction = ({
+      planned,
+      mode,
+      legacyResult = null,
+      publicationOwner = 'legacy',
+      authorityDecision = null,
+      authorityEligible = false
+    } = {}) => {
+      if (!planned?.attempted || !Array.isArray(globalThis.__hmTransactionFirstTrace)) return null
+      const ownership = planned.ownership
+      const journal = planned.journal
+      const legacyMarkdown = typeof legacyResult === 'string'
+        ? legacyResult
+        : legacyResult?.markdown
+      const comparison = !ownership?.ok
+        ? 'transaction-rejected'
+        : typeof legacyMarkdown === 'string'
+          ? ownership.result.markdown === legacyMarkdown ? 'byte-equal' : 'byte-diverged'
+          : 'legacy-unavailable'
+      const transactionReason = ownership?.ok
+        ? ownership.result.reason
+        : ownership?.reason || 'missing-transaction-result'
+      const result = {
+        phase: 'reconcile',
+        mode,
+        ownership: ownership?.ok ? 'owned' : 'rejected',
+        transactionReason,
+        transactionFamily: ownership?.family || null,
+        comparison,
+        promotionEligible: comparison === 'byte-equal',
+        publicationOwner,
+        authorityDecision: authorityDecision || (
+          mode === 'authoritative'
+            ? ownership?.ok ? 'authority-publication-rejected' : 'authority-transaction-rejected'
+            : 'authority-disabled'
+        ),
+        authorityEligible,
+        chainLength: journal?.transactionCount || 0,
+        chainReasons: [transactionReason],
+        sourceMapEntries: ownership?.proof?.plainParagraphCount || journal?.oldDoc?.childCount || 0,
+        stepNames: (journal?.stepDetails || []).map((entry) => entry.name),
+        reconcileReason: ownership?.reset ? ownership.reason : 'matched-snapshot',
+        journalId: journal?.journalId || null,
+        baseRevision: journal?.baseRevision ?? null
+      }
+      globalThis.__hmTransactionFirstTrace.push(result)
+      if (globalThis.__hmTransactionFirstTrace.length > 200) {
+        globalThis.__hmTransactionFirstTrace.shift()
+      }
+      return result
+    }
+
+    const publishPlannedPlainParagraphTransaction = ({
+      planned,
+      notifyChange,
+      boundary
+    } = {}) => {
+      if (!planned?.ok || !planned.ownership?.ok) {
+        return { attempted: planned?.attempted === true, ok: false, reason: planned?.ownership?.reason }
+      }
+      const coordinated = sourceSyncBridge.publishOwned({
+        ownership: planned.ownership,
+        notifyChange,
+        boundary
+      })
+      if (!coordinated?.ok) {
+        return {
+          attempted: true,
+          ok: false,
+          reason: coordinated?.reason || 'source-document-mismatch'
+        }
+      }
+      pendingSourceSyncTransactionJournal = null
+      if (Array.isArray(globalThis.__hmPreserveLog)) {
+        globalThis.__hmPreserveLog.push({
+          source: planned.journal.source,
+          previous: planned.journal.canonical,
+          next: planned.ownership.canonical,
+          markdown: planned.ownership.result.markdown,
+          preserved: true,
+          reason: planned.ownership.result.reason,
+          integrityProof: planned.ownership.proof
+        })
+        if (globalThis.__hmPreserveLog.length > 200) globalThis.__hmPreserveLog.shift()
+      }
+      return {
+        attempted: true,
+        ok: true,
+        markdown: planned.ownership.result.markdown,
+        reason: planned.ownership.result.reason,
+        coordinated
+      }
+    }
+
+    const publishPendingTransactionJournal = ({
+      canonical,
+      expectedDoc,
+      notifyChange = false
+    } = {}) => {
+      cancelDeferredMarkdownSync()
+      const structuralResult = publishPendingStructuralTransaction({
+        canonical,
+        expectedDoc,
+        site: 'forced-flush',
+        notifyChange
+      })
+      if (
+        structuralResult.ok ||
+        structuralResult.legacyBlocked === true ||
+        transactionFirstMode() !== 'authoritative'
+      ) {
+        return structuralResult
+      }
+
+      const planned = planPendingPlainParagraphTransaction({
+        canonical,
+        expectedDoc,
+        boundary: 'transaction-first-forced-flush-authority'
+      })
+      if (!planned.ok) {
+        tracePlainParagraphTransaction({
+          planned,
+          mode: 'authoritative',
+          publicationOwner: 'legacy',
+          authorityDecision: 'authority-transaction-rejected',
+          authorityEligible: false
+        })
+        return {
+          attempted: structuralResult.attempted || planned.attempted,
+          ok: false,
+          reason: planned.ownership?.reason || structuralResult.reason
+        }
+      }
+      const published = publishPlannedPlainParagraphTransaction({
+        planned,
+        notifyChange,
+        boundary: 'transaction-first-forced-flush-authority'
+      })
+      tracePlainParagraphTransaction({
+        planned,
+        mode: 'authoritative',
+        publicationOwner: published.ok ? 'transaction' : 'legacy',
+        authorityDecision: published.ok ? 'authority-owned' : 'authority-publication-rejected',
+        authorityEligible: published.ok
+      })
+      return published
+    }
+
+    // Both `markdownUpdated` and an immediate rich -> source flush need the
+    // identical generated-document serialization. The latter can run before
+    // Milkdown has delivered the input-rule callback, so it must still consume
+    // the physical `-` / `*` / `+` intent captured by the DOM binding.
+    const generatedScratchMarkdownForCanonical = (canonical, consumeInputIntent = false) => {
+      let markdown = generatedScratchMarkdown(canonical)
+      const generatedInputIntents = pendingMarkdownInputIntents.length
+        ? pendingMarkdownInputIntents
+        : pendingMarkdownInputIntent ? [pendingMarkdownInputIntent] : []
+      const consumedInputIntents = new Set()
+      for (const inputIntent of generatedInputIntents) {
+        if (inputIntent?.type !== 'bullet-list' && inputIntent?.type !== 'ordered-list') continue
+        try {
+          const remark = crepe.editor.ctx.get(remarkCtx)
+          const currentView = viewRef.current
+          const canonicalOffset = pmPosToMarkdownOffset(
+            canonical,
+            inputIntent.pmPos ?? currentView?.state.selection.head,
+            currentView?.state.doc,
+            remark
+          )
+          const restored = restoreTypedBulletMarker({
+            markdown,
+            canonical,
+            previousCanonical: inputIntent.canonical,
+            canonicalOffset,
+            marker: inputIntent.marker
+          })
+          // A real macOS key sequence can publish an intermediate
+          // markdownUpdated for the literal `-`/`+` line *before* Milkdown's
+          // input rule turns it into a list.  Do not discard the intent in that
+          // intermediate callback: only consume it once it actually changed a
+          // serialized list marker.  Otherwise the following list transaction
+          // falls back to Crepe's `*` permanently.
+          if (restored !== markdown) consumedInputIntents.add(inputIntent)
+          markdown = restored
+        } catch {
+          // Canonical Markdown is still structurally correct if a transient
+          // selection cannot be mapped while the editor is switching modes.
+        }
+      }
+      markdown = preserveGeneratedBulletMarkers(lastMarkdownRef.current, markdown)
+      if (consumedInputIntents.size) {
+        pendingMarkdownInputIntents = pendingMarkdownInputIntents
+          .filter((intent) => !consumedInputIntents.has(intent))
+        if (pendingMarkdownInputIntent && consumedInputIntents.has(pendingMarkdownInputIntent)) {
+          if (Array.isArray(globalThis.__hmListIntentTrace)) {
+            globalThis.__hmListIntentTrace.push({
+              phase: 'consumed-by-generated-marker-restore',
+              marker: pendingMarkdownInputIntent.marker,
+              sourceSlotRawStart: pendingMarkdownInputIntent.sourceSlotRawStart
+            })
+          }
+          pendingMarkdownInputIntent = pendingMarkdownInputIntents.at(-1) || null
+        }
+      }
+      if (consumeInputIntent) {
+        // A source-mode flush must not throw away an intent that has only seen
+        // the literal pre-input marker. Keep unresolved intents for the next
+        // real list transaction; stale entries are already pruned at capture.
+        pendingMarkdownInputIntents = pendingMarkdownInputIntents
+          .filter((intent) => Date.now() - intent.at < 30000)
+      }
+      return markdown
+    }
+
+    // Block controls live in editor-block-controls.js; mount them here and
+    // reuse the same conversion path across shortcuts, menus and toolbars.
+    const { setBlock: setEditableBlock, canConvertCurrentBlockToList, convertCurrentBlockToList, reportActiveBlock } = createBlockControls({
+      viewRef,
+      setCtxMenu,
+      onActiveBlock,
+      lastBlockRef
+    })
+    const setBlock = (id, blockPos = null) => {
+      if (readOnlyRef.current) return false
+      markUserEdit()
+      return setEditableBlock(id, blockPos)
+    }
+    const convertBlockToList = (targetType, blockPos) => {
+      if (readOnlyRef.current) return false
+      const sourceBeforeConversion = lastMarkdownRef.current
+      const canonicalBeforeConversion = canonicalMarkdownRef.current
+      let sourceOffset = null
+      try {
+        const view = viewRef.current
+        const remark = crepe.editor.ctx.get(remarkCtx)
+        const mappingPos = Number.isFinite(blockPos) ? blockPos : view?.state.selection.head
+        sourceOffset = pmPosToMarkdownOffset(
+          sourceBeforeConversion,
+          mappingPos,
+          view?.state.doc,
+          remark
+        )
+      } catch {
+        // The generic preservation path below remains available if the source
+        // mapping is temporarily unavailable during teardown.
+      }
+      const converted = convertCurrentBlockToList(targetType, blockPos)
+      if (converted) {
+        markUserEdit()
+        // ProseMirror has already committed the structural change, while
+        // Crepe's markdownUpdated event may arrive a frame later. Commit this
+        // snapshot now so an immediate source-mode switch or save cannot read
+        // the paragraph from before it was wrapped as a list.
+        try {
+          // `crepe.getMarkdown()` is an asynchronously published cache and can
+          // still describe the paragraph immediately after ProseMirror has
+          // wrapped it as a list. Structural commands need the transaction
+          // document itself, otherwise a later conversion overwrites the
+          // previous one in source mode.
+          const view = viewRef.current
+          const serializer = crepe.editor.ctx.get(serializerCtx)
+          const canonical = canonicalForSource(serializer(view.state.doc))
+          const preserved = preserveRichMarkdownSource(
+            sourceBeforeConversion,
+            canonicalBeforeConversion,
+            canonical
+          )
+          // Wrapping a paragraph has no visible-text delta. This transaction
+          // changes only the exact pre-transaction paragraph, so its authored
+          // source line is more precise than a whole-document structural diff.
+          const exactLineFallback = canonical !== canonicalBeforeConversion
+            ? convertSourceParagraphLineToList(sourceBeforeConversion, sourceOffset, targetType)
+            : null
+          const result = exactLineFallback
+            ? {
+                markdown: exactLineFallback,
+                preserved: true,
+                reason: 'block-to-list-exact-line'
+              }
+            : preserved
+          const planned = listConversionSnapshotSourceSyncOwner.planBlockToList({
+            source: sourceBeforeConversion,
+            previousCanonical: canonicalBeforeConversion,
+            currentSource: lastMarkdownRef.current,
+            currentCanonical: canonicalMarkdownRef.current,
+            result,
+            canonical,
+            expectedDoc: view.state.doc,
+            targetType,
+            sourceOffset
+          })
+          if (planned.ok) {
+            const coordinated = sourceSyncBridge.publish(planned.publication)
+            if (coordinated?.ok) {
+              pendingSourceSyncTransactionJournal = null
+              clearRichFlushPending()
+            } else userEditUntil = Date.now() + 1000
+          }
+        } catch {
+          // markdownUpdated remains the authoritative fallback if a serializer
+          // plugin is temporarily unavailable during editor teardown.
+        }
+      }
+      return converted
+    }
+    const canConvertBlockToList = (blockPos) => !readOnlyRef.current && canConvertCurrentBlockToList(blockPos)
+    const convertList = (targetType, listPos, anchorPos) => {
+      if (readOnlyRef.current) return false
+      const view = viewRef.current
+      if (!view) return false
+      // Record source offsets before changing the document. Crepe's
+      // markdownUpdated callback is the authoritative transaction boundary;
+      // deferring this into a later task can serialize a stale snapshot during
+      // two consecutive conversions and overwrite the second visible change.
+      if (Number.isFinite(listPos) && lastMarkdownRef.current) {
+        try {
+          const remark = crepe.editor.ctx.get(remarkCtx)
+          // A list container boundary has no visible Markdown character. On a
+          // nested tree, mapping `listPos + 1` can therefore land in the first
+          // child list and patch the wrong source level. Use the actual text
+          // position hit by the context menu; the replacement keeps text node
+          // sizes stable, so the same anchor remains valid after conversion.
+          const mappingPos = Number.isFinite(anchorPos)
+            ? Math.max(listPos + 1, Math.min(anchorPos, view.state.doc.content.size))
+            : view.state.selection.head
+          const sourceOffset = pmPosToMarkdownOffset(
+            lastMarkdownRef.current,
+            mappingPos,
+            view.state.doc,
+            remark
+          )
+          const previousOffset = pmPosToMarkdownOffset(
+            canonicalMarkdownRef.current,
+            mappingPos,
+            view.state.doc,
+            remark
+          )
+          if (Number.isFinite(sourceOffset) && Number.isFinite(previousOffset)) {
+            pendingListConversion = {
+              source: lastMarkdownRef.current,
+              sourceOffset,
+              listPos,
+              anchorPos: mappingPos,
+              previous: canonicalMarkdownRef.current,
+              previousOffset,
+              targetType
+            }
+          }
+        } catch {
+          pendingListConversion = null
+        }
+      }
+      markUserEdit()
+      // Capture the conversion-only document before dispatch. markdownUpdated
+      // can run during dispatch or after the user's next keystroke, so taking
+      // this snapshot afterwards is inherently racy.
+      const pending = pendingListConversion
+      let conversionPreparationFailed = false
+      const converted = convertListAtSelection(view, targetType, listPos, (convertedDoc) => {
+        if (!pending || pendingListConversion !== pending) {
+          conversionPreparationFailed = true
+          return false
+        }
+        try {
+          const serializer = crepe.editor.ctx.get(serializerCtx)
+          const convertedCanonical = canonicalForSource(serializer(convertedDoc))
+          const remark = crepe.editor.ctx.get(remarkCtx)
+          const convertedOffset = pmPosToMarkdownOffset(
+            convertedCanonical,
+            Math.min(pending.anchorPos, convertedDoc.content.size),
+            convertedDoc,
+            remark
+          )
+          const convertedSource = Number.isFinite(convertedOffset)
+            ? replaceMarkdownListBlock({
+                source: pending.source,
+                next: convertedCanonical,
+                sourceOffset: pending.sourceOffset,
+                nextOffset: convertedOffset,
+                previous: pending.previous,
+                previousOffset: pending.previousOffset
+              })
+            : null
+          if (convertedSource) {
+            pending.convertedCanonical = convertedCanonical
+            pending.convertedSource = convertedSource
+            pending.convertedDoc = convertedDoc
+            return true
+          }
+        } catch (error) {
+          console.error('List conversion source snapshot failed', error)
+        }
+        conversionPreparationFailed = true
+        return false
+      })
+      if (!converted) {
+        pendingListConversion = null
+        if (conversionPreparationFailed) fireToast(tRef.current('list.convertFailed'))
+        return false
+      }
+      // Some Milkdown paths do not emit markdownUpdated until a later input or
+      // source-mode flush. Commit the verified conversion snapshot now; if the
+      // callback already ran during dispatch it has cleared this same object.
+      if (
+        pendingListConversion === pending &&
+        pending?.convertedSource &&
+        pending?.convertedCanonical
+      ) {
+        const planned = listConversionSnapshotSourceSyncOwner.planListTypeConversion({
+          token: pending,
+          activeToken: pendingListConversion,
+          currentSource: lastMarkdownRef.current,
+          currentCanonical: canonicalMarkdownRef.current,
+          expectedDoc: view.state.doc
+        })
+        if (planned.ok) {
+          const coordinated = sourceSyncBridge.publish(planned.publication)
+          if (coordinated?.ok) {
+            pendingSourceSyncTransactionJournal = null
+            clearRichFlushPending()
+            pendingListConversion = null
+          } else {
+            userEditUntil = Date.now() + 1000
+          }
+        }
+      }
+      view.focus()
+      setCtxMenu(null)
+      return true
+    }
+
+    // IMPORTANT: register listeners BEFORE create(). Crepe wires them during
+    // create(), so registering afterwards means `markdownUpdated` never fires —
+    // which left tab.content (outline, word count, dirty state, and saves!)
+    // frozen at the initial value while the editor was actually edited.
+    //
+    // `appending` is set while the remaining chunks of a huge doc are being
+    // parsed+inserted in the background — those dispatches fire markdownUpdated
+    // too, and we must ignore them so tab.content isn't spammed with partial
+    // docs. Only real user edits propagate.
+    crepe.on((api) => {
+      const handleMarkdownUpdatedImpl = (_ctx, md) => {
+        const canonical = canonicalForSource(md)
+        if (programmaticReplaceRef.current) {
+          wholeDocumentReplacementPending = null
+          pendingSourceSyncTransactionJournal = null
+          // replaceAll can publish more than one Markdown transaction. Keep all
+          // of them outside the user-edit path until the next explicit input
+          // calls markUserEdit; consuming only the first callback is racy.
+          canonicalMarkdownRef.current = canonical
+          return
+        }
+        // IME composition (pinyin / cangjie / kana …) pushes the in-flight
+        // candidate text into the document. Processing markdownUpdated
+        // mid-composition captures that transient text and corrupts the source
+        // (e.g. "测试" ends up as pinyin fragments "c", "ce", "s"). Defer: PM's
+        // `view.composing` is true only while a composition is active, and
+        // compositionend fires a final markdownUpdated with the committed
+        // characters, which is the only state worth preserving.
+        if (viewRef.current?.composing) return
+        const pendingPaste = pendingRawMarkdownPasteRef.current
+        const pendingList = pendingListConversion
+        const pendingWholeDocumentReplacement = wholeDocumentReplacementPending
+        if (ready && !appending && (pendingPaste || pendingWholeDocumentReplacement || hasRecentUserEdit())) {
+          const hasPendingListIntent = hasBlockingListInputIntent()
+          let pendingPlainParagraphPlan = null
+          const plainTransactionMode = transactionFirstMode()
+          if (!pendingPaste && !pendingList && !pendingWholeDocumentReplacement && !hasPendingListIntent) {
+            const reprinted = publishReprint({ canonical, boundary: 'source-reprint-markdown-updated', notifyChange: true })
+            if (reprinted != null) {
+              clearRichFlushPending()
+              userEditUntil = Date.now() + 1000
+              return
+            }
+          }
+          // Focused structural owners inspect the same journal before any
+          // whole-document canonical diff. The registry currently owns exact
+          // single-list-subtree and existing fenced-code content families;
+          // quote/table migration adds owners there rather than callback branches.
+          if (
+            !pendingPaste &&
+            !pendingList &&
+            !pendingWholeDocumentReplacement &&
+            !hasPendingListIntent &&
+            pendingSourceSyncTransactionJournal
+          ) {
+            const ownedStructuralTransaction = publishPendingStructuralTransaction({
+              canonical,
+              expectedDoc: viewRef.current?.state.doc,
+              site: 'markdown-updated',
+              notifyChange: true
+            })
+            if (ownedStructuralTransaction.ok) {
+              transactionSourcePendingPublish = false
+              transactionSourcePendingDoc = null
+              transactionSourceBlockHints = []
+              transactionSourceQuarantined = false
+              wholeDocumentReplacementPending = null
+              clearRichFlushPending()
+              pendingRawMarkdownPasteRef.current = null
+              pendingListConversion = null
+              userEditUntil = Date.now() + 1000
+              return
+            }
+            const retiredLegacyFailure = retiredLegacySourceSyncFailureReason(
+              ownedStructuralTransaction
+            )
+            if (retiredLegacyFailure) {
+              // STRUCTURAL (E0): in scratch, a retired family's unprovable
+              // rejection must not strand the doc — the serializer canonical
+              // is an acceptable fallback source (validated) when there are no
+              // authored bytes to protect. Existing files stay fail-closed.
+              if (generatedScratchRef.current) {
+                try {
+                  const markerPreserving = preserveGeneratedBulletMarkers(
+                    lastMarkdownRef.current,
+                    canonical
+                  )
+                  const scratchCandidate = {
+                    preserved: true,
+                    markdown: markerPreserving !== canonical ? markerPreserving : canonical,
+                    reason: 'generated-scratch-canonical-fallback',
+                    integrityProof: null
+                  }
+                  const scratchPrepared = sourceSyncBridge.prepare({
+                    result: scratchCandidate,
+                    canonical,
+                    expectedDoc: viewRef.current?.state.doc,
+                    validationSite: 'generated-scratch-canonical-fallback',
+                    boundary: 'markdown-updated'
+                  })
+                  if (scratchPrepared?.validation?.ok === true) {
+                    const coordinatedFallback = sourceSyncBridge.publishPrepared(
+                      scratchPrepared,
+                      { notifyChange: true }
+                    )
+                    if (coordinatedFallback?.ok) {
+                      traceEditorEvent('scratch-canonical-fallback', {
+                        trigger: retiredLegacyFailure,
+                        site: 'retired-structural'
+                      })
+                      transactionSourcePendingPublish = false
+                      transactionSourcePendingDoc = null
+                      transactionSourceBlockHints = []
+                      transactionSourceQuarantined = false
+                      wholeDocumentReplacementPending = null
+                      clearRichFlushPending()
+                      pendingSourceSyncTransactionJournal = null
+                      userEditUntil = Date.now() + 1000
+                      return
+                    }
+                  }
+                } catch {
+                  /* fall through to the fail-closed warning */
+                }
+              }
+              reportSourceSyncFailure(retiredLegacyFailure)
+              userEditUntil = Date.now() + 1000
+              return
+            }
+            if (
+              ownedStructuralTransaction.deferred === true &&
+              ownedStructuralTransaction.holdJournal === true
+            ) {
+              // A focused lifecycle owner has fully proven this intermediate
+              // PM state but intentionally retains the same journal for the
+              // next physical transaction. Do not let legacy canonical-diff
+              // inference race ahead and publish a partial source candidate.
+              userEditUntil = Date.now() + 1000
+              return
+            }
+          }
+          // Plain paragraph authority/shadow consumes the same immutable
+          // transaction journal as list topology. Authority publishes before
+          // legacy inference; shadow retains only a local plan for byte
+          // comparison after the legacy candidate is computed.
+          if (
+            !pendingPaste &&
+            !pendingList &&
+            !pendingWholeDocumentReplacement &&
+            !generatedScratchRef.current &&
+            !hasPendingListIntent &&
+            pendingSourceSyncTransactionJournal &&
+            plainTransactionMode !== 'disabled'
+          ) {
+            pendingPlainParagraphPlan = planPendingPlainParagraphTransaction({
+              canonical,
+              expectedDoc: viewRef.current?.state.doc,
+              boundary: 'transaction-first-early-authority'
+            })
+            if (plainTransactionMode === 'authoritative' && pendingPlainParagraphPlan.ok) {
+              const published = publishPlannedPlainParagraphTransaction({
+                planned: pendingPlainParagraphPlan,
+                notifyChange: true,
+                boundary: 'transaction-first-early-authority'
+              })
+              tracePlainParagraphTransaction({
+                planned: pendingPlainParagraphPlan,
+                mode: 'authoritative',
+                publicationOwner: published.ok ? 'transaction' : 'legacy',
+                authorityDecision: published.ok ? 'authority-owned' : 'authority-publication-rejected',
+                authorityEligible: published.ok
+              })
+              if (published.ok) {
+                transactionSourcePendingPublish = false
+                transactionSourcePendingDoc = null
+                transactionSourceBlockHints = []
+                transactionSourceQuarantined = false
+                wholeDocumentReplacementPending = null
+                clearRichFlushPending()
+                pendingRawMarkdownPasteRef.current = null
+                pendingListConversion = null
+                userEditUntil = Date.now() + 1000
+                return
+              }
+            }
+          }
+          // A pending list intent still needs its marker/slot reconstruction
+          // even when the mapper already owned a later transaction (for
+          // example typing in another block before the deferred list callback
+          // landed). Skip the fast confirm path so the intent branch below
+          // can fix up the list on top of the current source snapshot.
+          if (!pendingPaste && !pendingList && !pendingWholeDocumentReplacement && transactionSourcePendingPublish && !hasPendingListIntent) {
+            try {
+              const parser = crepe.editor.ctx.get(parserCtx)
+              const currentDoc = viewRef.current?.state.doc
+              const callbackDoc = parser(canonical)
+              if (
+                transactionSourcePendingDoc?.eq?.(currentDoc) === true &&
+                areSourceDocumentsEquivalent(callbackDoc, transactionSourcePendingDoc)
+              ) {
+                canonicalMarkdownRef.current = canonical
+                clearRichFlushPending()
+                transactionSourcePendingPublish = false
+                transactionSourcePendingDoc = null
+                transactionSourceQuarantined = false
+                pendingSourceSyncTransactionJournal = null
+                onChange?.(lastMarkdownRef.current, false)
+                return
+              }
+            } catch {
+              // The callback was not proven to represent the owned PM state;
+              // continue into the established fail-closed preservation path.
+            }
+          }
+          // Milkdown's listener can deliver a late callback whose Markdown is
+          // a different serialization of a document the Coordinator already
+          // published (rs-41: a raw Markdown paste ending in a list publishes
+          // its exact bytes with the trailing-paragraph `<br />` canonical,
+          // then the heading-id sync and listener report `...\n\n`). The
+          // live doc is unchanged since that publication, so there is nothing
+          // to map — re-running the legacy diff dropped the final newline.
+          // Re-prove the committed source against the live doc and stop.
+          if (
+            !pendingPaste &&
+            !pendingList &&
+            !pendingWholeDocumentReplacement &&
+            !hasPendingListIntent &&
+            !pendingSourceSyncTransactionJournal &&
+            canonical !== canonicalMarkdownRef.current
+          ) {
+            const snapshot = sourceSyncBridge.getSnapshot()
+            const liveDoc = viewRef.current?.state.doc
+            if (
+              snapshot.doc &&
+              liveDoc &&
+              snapshot.source === String(lastMarkdownRef.current ?? '') &&
+              snapshot.canonical === String(canonicalMarkdownRef.current ?? '') &&
+              (snapshot.doc.eq(liveDoc) || sameIgnoringHeadingIds(snapshot.doc, liveDoc)) &&
+              validateTransactionMarkdown({ markdown: String(lastMarkdownRef.current ?? ''), expectedDoc: liveDoc }) === true
+            ) {
+              clearRichFlushPending()
+              transactionSourceQuarantined = false
+              return
+            }
+          }
+          if (
+            !pendingPaste &&
+            !pendingList &&
+            !pendingWholeDocumentReplacement &&
+            canonical === canonicalMarkdownRef.current &&
+            !hasPendingListIntent
+          ) {
+            // The canonical cache can be unchanged even after an earlier
+            // preservation branch accidentally committed the wrong source.
+            // Validate this fast path too; otherwise source mode/save would
+            // silently return the divergent authored bytes forever.
+            const committedIntegrity = validateSourceCandidate(
+              lastMarkdownRef.current,
+              viewRef.current?.state.doc,
+              canonical,
+              lastMarkdownRef.current,
+              'committed-source-baseline'
+            )
+            if (committedIntegrity.ok === false) {
+              reportSourceSyncFailure(committedIntegrity.reason)
+              userEditUntil = Date.now() + 1000
+              return
+            }
+            clearRichFlushPending()
+            transactionSourceQuarantined = false
+            pendingSourceSyncTransactionJournal = null
+            if (transactionSourcePendingPublish) {
+              transactionSourcePendingPublish = false
+              transactionSourcePendingDoc = null
+              onChange?.(lastMarkdownRef.current, false)
+            }
+            return
+          }
+          // A paste whose clipboard bytes could not be kept (below) goes to
+          // the source reprint first, like every other edit: it used to fall
+          // straight to the legacy owners, which cannot place pasted blocks
+          // inside a list item (#171).
+          let pasteTokenReleased = false
+          if (pendingPaste || pendingWholeDocumentReplacement) {
+            const currentDoc = viewRef.current?.state.doc
+            const ownership = pendingPaste
+              ? documentReplacementSourceSyncOwner.planRawMarkdownPaste({
+                  token: pendingPaste,
+                  activeToken: pendingRawMarkdownPasteRef.current,
+                  currentSource: lastMarkdownRef.current,
+                  currentCanonical: canonicalMarkdownRef.current,
+                  canonical,
+                  expectedDoc: currentDoc
+                })
+              : documentReplacementSourceSyncOwner.planWholeDocumentReplacement({
+                  token: pendingWholeDocumentReplacement,
+                  activeToken: wholeDocumentReplacementPending,
+                  currentSource: lastMarkdownRef.current,
+                  currentCanonical: canonicalMarkdownRef.current,
+                  canonical,
+                  replacementCanonical: generatedScratchMarkdown(canonical),
+                  expectedDoc: currentDoc
+                })
+            if (!ownership.ok) {
+              // STRUCTURAL (E0, 0.13.179 + P3n 0.13.181 traces): a
+              // multi-transaction paste lets the first transaction's callback
+              // publish and advance the baseline BEFORE this retry runs, so
+              // the token is provably stale/unproven against the CURRENT
+              // state — on scratch AND on saved files. Release the token and
+              // fall through to the normal preserve pipeline below, which
+              // fully validates its candidate before committing: it publishes
+              // the pasted content when it can prove the mapping and fails
+              // closed with a precise reason when it cannot. Warning here
+              // reported a race the pipeline had already (or could still)
+              // resolve correctly.
+              pendingRawMarkdownPasteRef.current = null
+              wholeDocumentReplacementPending = null
+              pasteTokenReleased = true
+              traceEditorEvent(generatedScratchRef.current
+                ? 'scratch-paste-token-released'
+                : 'paste-token-released-committed-baseline', {
+                stage: 'plan',
+                reason: ownership.reason || null
+              })
+            } else {
+            const coordinatedReplacement = sourceSyncBridge.publishOwned({ ownership })
+            if (!coordinatedReplacement?.ok) {
+              // Same release-and-fall-through contract as the plan failure
+              // above: a stale live document at publish time is the same
+              // multi-transaction race. The preserve pipeline below owns the
+              // validated publication (or the fail-closed warning).
+              pendingRawMarkdownPasteRef.current = null
+              wholeDocumentReplacementPending = null
+              pasteTokenReleased = true
+              traceEditorEvent(generatedScratchRef.current
+                ? 'scratch-paste-token-released'
+                : 'paste-token-released-committed-baseline', {
+                stage: 'publish',
+                reason: coordinatedReplacement?.reason || null
+              })
+            } else {
+            transactionSourcePendingPublish = false
+            transactionSourcePendingDoc = null
+            transactionSourceBlockHints = []
+            transactionSourceQuarantined = false
+            wholeDocumentReplacementPending = null
+            clearRichFlushPending()
+            pendingRawMarkdownPasteRef.current = null
+            pendingListConversion = null
+            pendingSourceSyncTransactionJournal = null
+            userEditUntil = Date.now() + 1000
+            return
+          }
+          }
+          }
+          if (pasteTokenReleased && !pendingList && !hasPendingListIntent) {
+            const reprinted = publishReprint({ canonical, boundary: 'source-reprint-after-paste', notifyChange: true })
+            if (reprinted != null) {
+              clearRichFlushPending()
+              userEditUntil = Date.now() + 1000
+              return
+            }
+          }
+          let preserved
+          if (generatedScratchRef.current) {
+            const markdown = generatedScratchMarkdownForCanonical(canonical)
+            // RS-51: Backspace on a generated empty list item can legitimately
+            // leave exactly one editor-owned trailing empty paragraph inside
+            // the preceding non-empty item. The normal preservation layer
+            // already has a narrow, proven `empty-list-item-removed` contract
+            // for this ProseMirror transient (including the raw post-list
+            // blank slot). Generated scratch used to bypass that classification
+            // and validate the compact full-canonical result under the generic
+            // reason, so semantic integrity rejected a valid Backspace.
+            //
+            // Keep generated scratch authoritative for every other transaction:
+            // only an exact successful reason from the established mapper may
+            // override the generated markdown/reason here.
+            const generatedLocalPreservation = preserveRichMarkdownSource(
+              lastMarkdownRef.current,
+              canonicalMarkdownRef.current,
+              canonical
+            )
+            const emptyListRemoved = generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'empty-list-item-removed'
+            const nestedEmptyListRemoved = generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'nested-empty-list-item-removed'
+            const emptyListItemMergedAfterNestedList = generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'empty-list-item-merged-after-nested-list'
+            const emptyOrderedItemMergedBeforeNestedList = generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'empty-ordered-item-merged-before-nested-list'
+            const trailingListItemParagraphEmptied = generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'trailing-list-item-paragraph-emptied'
+            const emptyTaskItemMergedToContinuation = generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'empty-task-item-merged-to-continuation'
+            const trailingEmptyBlockquoteParagraphCreated = generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'trailing-empty-blockquote-paragraph-created'
+            const postListToken = generatedPostListEmptyTransientRef.current
+            const postListCheckpointMatches = Boolean(
+              postListToken &&
+              postListToken.source === lastMarkdownRef.current &&
+              postListToken.canonical === canonicalMarkdownRef.current
+            )
+            const postListEmptyFilled = Boolean(
+              postListCheckpointMatches &&
+              generatedLocalPreservation?.preserved !== false &&
+              generatedLocalPreservation?.reason === 'trailing-empty-block-filled'
+            )
+
+            if (
+              emptyListRemoved ||
+              nestedEmptyListRemoved ||
+              emptyListItemMergedAfterNestedList ||
+              emptyOrderedItemMergedBeforeNestedList ||
+              trailingListItemParagraphEmptied ||
+              emptyTaskItemMergedToContinuation ||
+              trailingEmptyBlockquoteParagraphCreated
+            ) {
+              preserved = generatedLocalPreservation
+              generatedPostListEmptyTransientRef.current = emptyListRemoved
+                ? {
+                    source: generatedLocalPreservation.markdown,
+                    canonical
+                  }
+                : null
+            } else if (postListEmptyFilled) {
+              preserved = generatedLocalPreservation
+              generatedPostListEmptyTransientRef.current = null
+            } else {
+              // Any different rich transaction invalidates the one-shot RS-52
+              // ownership proof. Source-mode viewing/flush does not enter this
+              // callback, so a pure mode round-trip keeps the checkpoint alive.
+              generatedPostListEmptyTransientRef.current = null
+              preserved = { markdown, reason: 'generated-scratch-canonical' }
+            }
+          } else if (pendingList?.convertedSource && pendingList?.convertedCanonical) {
+            preserved = canonical === pendingList.convertedCanonical
+              ? { markdown: pendingList.convertedSource }
+              : preserveRichMarkdownSource(
+                  pendingList.convertedSource,
+                  pendingList.convertedCanonical,
+                  canonical
+                )
+          } else if (pendingList) {
+            try {
+              const remark = crepe.editor.ctx.get(remarkCtx)
+              const nextOffset = pmPosToMarkdownOffset(
+                canonical,
+                Math.min(pendingList.anchorPos, viewRef.current?.state.doc.content.size || 1),
+                viewRef.current?.state.doc,
+                remark
+              )
+              const markdown = Number.isFinite(nextOffset)
+                ? replaceMarkdownListBlock({
+                    source: pendingList.source,
+                    next: canonical,
+                    sourceOffset: pendingList.sourceOffset,
+                    nextOffset,
+                    previous: pendingList.previous,
+                    previousOffset: pendingList.previousOffset
+                  })
+                : null
+              preserved = markdown
+                ? { markdown }
+                : preserveRichMarkdownSource(
+                    pendingList.source,
+                    pendingList.previous,
+                    canonical
+                  )
+            } catch {
+              preserved = preserveRichMarkdownSource(
+                pendingList.source,
+                pendingList.previous,
+                canonical
+              )
+            }
+          } else {
+            preserved = preserveRichMarkdownSource(
+              lastMarkdownRef.current,
+              canonicalMarkdownRef.current,
+              canonical
+            )
+          }
+          preserved = reconcileUnchangedSourceResult({
+            result: preserved,
+            source: lastMarkdownRef.current,
+            canonical,
+            expectedDoc: viewRef.current?.state.doc,
+            parseMarkdown: (value) => crepe.editor.ctx.get(parserCtx)(value)
+          })
+          const preservedBeforeInputRule = preserved
+          let pendingInputCanonicalOffset = null
+          let consumedInputIntentForIntegrity = null
+          traceEditorEvent('markdown-sync', {
+            // Doc bytes (4 × ~333KB on large files) go over IPC and to disk
+            // on EVERY callback — that alone dominated per-keystroke cost in
+            // traced sessions (~1MB/callback). Lengths always; full bytes
+            // only for FAILED preserves (the next successful publish is
+            // reconstructable from journal state, and failures get a full
+            // evidence dump anyway).
+            canonical: preserved?.preserved === false ? canonical : null,
+            canonicalLength: canonical?.length ?? 0,
+            previousCanonical: preserved?.preserved === false ? canonicalMarkdownRef.current : null,
+            source: preserved?.preserved === false ? lastMarkdownRef.current : null,
+            preserved: preserved?.preserved !== false,
+            reason: preserved?.reason || null,
+            markdown: preserved?.preserved === false ? (preserved?.markdown ?? null) : null
+          })
+          const currentView = viewRef.current
+          const selectionInList = (() => {
+            const $head = currentView?.state.selection.$head
+            if (!$head) return false
+            for (let depth = $head.depth; depth > 0; depth -= 1) {
+              const name = $head.node(depth).type.name
+              if (name === 'bullet_list' || name === 'ordered_list') return true
+            }
+            return false
+          })()
+          const intentAnchorInList = (() => {
+            if (!Number.isFinite(pendingMarkdownInputIntent?.pmPos)) return false
+            const doc = currentView?.state.doc
+            if (!doc) return false
+            try {
+              const safe = Math.max(1, Math.min(pendingMarkdownInputIntent.pmPos, doc.content.size))
+              const $anchor = doc.resolve(safe)
+              for (let depth = $anchor.depth; depth > 0; depth -= 1) {
+                const name = $anchor.node(depth).type.name
+                if (name === 'bullet_list' || name === 'ordered_list') return true
+              }
+            } catch {
+              return false
+            }
+            return false
+          })()
+          if (
+            isActiveListInputIntent(pendingMarkdownInputIntent) &&
+            pendingMarkdownInputIntent?.consumed !== true
+          ) {
+            try {
+              // Do not gate the input-rule intent on the *current* selection
+              // or on a mapped point still resolving inside the new list. An
+              // input rule replaces the marker paragraph structurally, and a
+              // deferred markdownUpdated may run after the user has exited the
+              // list (or after later transactions mapped the captured point to
+              // its boundary). The reconstruction helper already proves that
+              // this exact canonical delta created a new list, so selection is
+              // diagnostic evidence rather than ownership authority.
+              // A literal marker callback may advance the canonical baseline
+              // just before Space applies the list input rule. That does not
+              // make the physical-key intent stale. Let the narrow helper
+              // prove an exactly-new list in the captured delta; it returns
+              // null instead of touching unrelated or older list trees.
+              const remark = crepe.editor.ctx.get(remarkCtx)
+              const canonicalOffset = pmPosToMarkdownOffset(
+                canonical,
+                Number.isFinite(pendingMarkdownInputIntent.pmPos)
+                  ? pendingMarkdownInputIntent.pmPos
+                  : currentView.state.selection.head,
+                currentView.state.doc,
+                remark
+              )
+              pendingInputCanonicalOffset = canonicalOffset
+              // A deferred markdownUpdated can batch title, body, list, and
+              // nested-list typing into one first callback. With no authored
+              // baseline yet, generic new-document preservation already owns
+              // the complete canonical document; replacing it with only the
+              // list targeted by an old input-rule intent would drop title and
+              // outer list items.
+              const inputStartedFromEmptyDocument =
+                !pendingMarkdownInputIntent.source &&
+                !pendingMarkdownInputIntent.canonical
+              let inputRuleMarkdown = inputStartedFromEmptyDocument
+                ? null
+                : preserveOwnedTypedBulletInputRule({
+                    source: pendingMarkdownInputIntent.source,
+                    currentSource: lastMarkdownRef.current,
+                    // A delayed intent contributes only its own block. If its
+                    // captured snapshot is no longer current, the helper keeps
+                    // the old raw-slot fail-closed proof against this candidate.
+                    preservedSource: preserved.markdown,
+                    canonical,
+                    previousCanonical: pendingMarkdownInputIntent.canonical,
+                    sourceOffset: pendingMarkdownInputIntent.sourceOffset,
+                    sourceSlotRawStart: pendingMarkdownInputIntent.sourceSlotRawStart,
+                    canonicalOffset,
+                    marker: pendingMarkdownInputIntent.marker
+                  })
+              const mappedMiddleListSlot = preserved.reason === 'middle-empty-block-list-filled'
+              if (Array.isArray(globalThis.__hmListIntentTrace)) {
+                globalThis.__hmListIntentTrace.push({
+                  phase: 'apply',
+                  marker: pendingMarkdownInputIntent.marker,
+                  sourceSlotRawStart: pendingMarkdownInputIntent.sourceSlotRawStart,
+                  inputRuleApplied: typeof inputRuleMarkdown === 'string',
+                  mappedMiddleListSlot,
+                  canonicalMatched: pendingMarkdownInputIntent.canonical === canonicalMarkdownRef.current,
+                  selectionInList,
+                  intentAnchorInList,
+                  pmPos: pendingMarkdownInputIntent.pmPos
+                })
+              }
+              if (inputRuleMarkdown) {
+                preserved = {
+                  ...preserved,
+                  markdown: inputRuleMarkdown,
+                  reason: 'typed-bullet-input-rule'
+                }
+              }
+              let markerRestored = false
+              // `preserveOwnedTypedBulletInputRule` already writes the physical
+              // bullet marker into an EXACT owned source line/slot. Running the
+              // broader bullet-marker restore again is not only redundant: for
+              // a newly-created EMPTY bullet after exiting an earlier list, its
+              // empty row has no text anchor and can be matched to that earlier
+              // list, duplicating the old block. Ordered lists are different —
+              // Crepe can still normalize `1.` to `1)` after reconstruction, so
+              // their item-specific punctuation restore remains necessary.
+              // A bullet that the ownership helper could not reconstruct still
+              // gets the established fallback restore below.
+              const markerRestoreNeeded =
+                pendingMarkdownInputIntent.type === 'ordered-list' ||
+                (pendingMarkdownInputIntent.type === 'bullet-list' && !inputRuleMarkdown)
+              if (markerRestoreNeeded) {
+                const markdown = restoreTypedBulletMarker({
+                  markdown: preserved.markdown,
+                  canonical,
+                  previousCanonical: pendingMarkdownInputIntent.canonical,
+                  canonicalOffset,
+                  marker: pendingMarkdownInputIntent.marker
+                })
+                if (markdown !== preserved.markdown) {
+                  markerRestored = true
+                  preserved = { ...preserved, markdown, reason: 'typed-bullet-marker' }
+                }
+              }
+              // This intent belongs to exactly one input-rule transition. Once
+              // its list has been reconstructed, retaining the old source
+              // snapshot makes a later Enter/Tab/nested-list transaction look
+              // like the original list creation and can replace the outer list
+              // with only its nested child. Subsequent typing is now handled by
+              // normal list-tree preservation against the new source baseline.
+              if (
+                inputRuleMarkdown ||
+                markerRestored ||
+                inputStartedFromEmptyDocument ||
+                mappedMiddleListSlot
+              ) {
+                const consumedIntent = pendingMarkdownInputIntent
+                consumedInputIntentForIntegrity = consumedIntent
+                // Any older intent that survived this callback is only allowed
+                // to be part of the same fast keyboard batch. Keeping an intent
+                // from a previous edit for 30 seconds is unsafe: after the
+                // current list is published, its old source offsets can still
+                // be applied to a later list and silently produce `1`, `-`,
+                // `*`, or an extra numbered row without tripping fail-closed.
+                const intentBatchWindow = 3000
+                pendingMarkdownInputIntents = pendingMarkdownInputIntents
+                  .filter((intent) =>
+                    isActiveListInputIntent(intent) &&
+                    Math.abs(Number(intent.at) - Number(consumedIntent.at)) <= intentBatchWindow &&
+                    intent.source === consumedIntent.source
+                  )
+                // Keep a consumed intent only for the short callback tail of
+                // this same input-rule dispatch. It must not survive a user's
+                // IME/body typing and the following Enter: that later callback
+                // belongs to the newly-created list item, not to the original
+                // marker. The old 3-second capture window was long enough for
+                // `1.` -> Space -> IME composition -> Enter to reuse the old
+                // marker and rewrite the new empty row (`2.` became `1.`).
+                const callbackTailUntil = Date.now() + 750
+                pendingMarkdownInputIntents = pendingMarkdownInputIntents.map((intent) =>
+                  intent === consumedIntent
+                    ? markSourceSyncListInputIntentConsumed(intent, callbackTailUntil)
+                    : {
+                        ...intent,
+                        batchUntil: Math.min(
+                          Number.isFinite(intent.batchUntil) ? intent.batchUntil : callbackTailUntil,
+                          callbackTailUntil
+                        )
+                      }
+                )
+                pendingMarkdownInputIntent = pendingMarkdownInputIntents.at(-1) || null
+                if (Array.isArray(globalThis.__hmListIntentTrace)) {
+                  globalThis.__hmListIntentTrace.push({
+                    phase: 'consumed-callback-tail',
+                    kept: pendingMarkdownInputIntents.length,
+                    expiresIn: callbackTailUntil - Date.now()
+                  })
+                }
+              }
+            } catch {
+              // The normal source-preservation result remains valid if the
+              // transient selection cannot be mapped during editor teardown.
+            }
+          } else if (pendingMarkdownInputIntent) {
+            if (Array.isArray(globalThis.__hmListIntentTrace)) {
+              globalThis.__hmListIntentTrace.push({
+                phase: 'cleared-without-list',
+                selectionInList,
+                intentAnchorInList,
+                sourceSlotRawStart: pendingMarkdownInputIntent.sourceSlotRawStart,
+                age: Date.now() - pendingMarkdownInputIntent.at,
+                type: pendingMarkdownInputIntent.type
+              })
+            }
+            pendingMarkdownInputIntent = null
+            pendingMarkdownInputIntents = pendingMarkdownInputIntents
+              .filter((intent) => isActiveListInputIntent(intent))
+          }
+          let preparedSourceSync = null
+          const prepareSourceSyncCandidate = (result, validationSite) =>
+            sourceSyncBridge.prepare({
+              result,
+              canonical,
+              expectedDoc: currentView?.state.doc,
+              validationSite,
+              boundary: 'markdown-updated'
+            })
+          // STRUCTURAL (E0, 0.13.176): a generated scratch document has no
+          // authored bytes on disk — its source is editor-derived. When every
+          // preservation path fails validation, the serializer canonical is an
+          // acceptable fallback source (it still goes through full
+          // coordinator validation). At worst marker spelling flips in the
+          // unsaved buffer; pausing sync with a sticky warning instead blocks
+          // the user's flow. Existing files keep the strict fail-closed warn.
+          const scratchCanonicalCandidate = (triggerReason) => {
+            if (!generatedScratchRef.current) return null
+            // Marker-friendly first: preserve the user's typed bullet spelling
+            // (`-`/`+`) on top of the canonical so scratch docs stay
+            // interoperable with other Markdown tools; the raw canonical (the
+            // spelling guaranteed to re-parse to this doc) is the floor when
+            // the transform fails validation.
+            const markerPreserving = preserveGeneratedBulletMarkers(
+              lastMarkdownRef.current,
+              canonical
+            )
+            const candidate = {
+              preserved: true,
+              markdown: markerPreserving !== canonical ? markerPreserving : canonical,
+              reason: 'generated-scratch-canonical-fallback',
+              integrityProof: null
+            }
+            const prepared = prepareSourceSyncCandidate(
+              candidate,
+              'generated-scratch-canonical-fallback'
+            )
+            if (prepared?.validation?.ok !== true) return null
+            return { candidate, prepared, triggerReason }
+          }
+          if (preserved.preserved !== false) {
+            preparedSourceSync = prepareSourceSyncCandidate(preserved, 'primary-preserved')
+            const integrity = preparedSourceSync.validation
+            if (integrity.ok === false) {
+              const candidateMarkdown = preserved.markdown
+              const fallbackPrepared = prepareSourceSyncCandidate(
+                preservedBeforeInputRule,
+                'before-input-rule-fallback'
+              )
+              const fallbackIntegrity = fallbackPrepared.validation
+              if (fallbackIntegrity.ok) {
+                let fallbackMarkdown = preservedBeforeInputRule.markdown
+                const intent = consumedInputIntentForIntegrity || pendingMarkdownInputIntent
+                if (intent && Number.isFinite(pendingInputCanonicalOffset)) {
+                  fallbackMarkdown = restoreTypedBulletMarker({
+                    markdown: fallbackMarkdown,
+                    canonical,
+                    previousCanonical: intent.canonical,
+                    canonicalOffset: pendingInputCanonicalOffset,
+                    marker: intent.marker
+                  })
+                }
+                const restoredResult = {
+                  ...preservedBeforeInputRule,
+                  markdown: fallbackMarkdown,
+                  reason: 'typed-bullet-input-rule-fallback',
+                  integrityProof: null
+                }
+                const restoredPrepared = prepareSourceSyncCandidate(
+                  restoredResult,
+                  'typed-bullet-input-rule-fallback'
+                )
+                if (restoredPrepared.validation.ok) {
+                  preserved = {
+                    ...preservedBeforeInputRule,
+                    markdown: fallbackMarkdown,
+                    reason: 'typed-bullet-input-rule-fallback'
+                  }
+                  preparedSourceSync = restoredPrepared
+                }
+              }
+              let postFallbackPrepared = null
+              const postFallbackOk = !(
+                preserved === preservedBeforeInputRule || preserved.preserved === false
+              ) && (() => {
+                postFallbackPrepared = prepareSourceSyncCandidate(
+                  preserved,
+                  'post-fallback-recheck'
+                )
+                return postFallbackPrepared.validation.ok
+              })()
+              if (!postFallbackOk) {
+                const reason = integrity.reason || 'source-document-mismatch'
+                const scratchFallback = scratchCanonicalCandidate(reason)
+                if (scratchFallback) {
+                  preserved = scratchFallback.candidate
+                  preparedSourceSync = scratchFallback.prepared
+                  traceEditorEvent('scratch-canonical-fallback', {
+                    trigger: reason,
+                    site: 'primary-preserved',
+                    from: preserved?.reason || null
+                  })
+                } else {
+                  preserved = {
+                    ...preserved,
+                    preserved: false,
+                    reason,
+                    markdown: lastMarkdownRef.current
+                  }
+                  reportSourceSyncFailure(reason)
+                  traceEditorEvent('markdown-sync-integrity', {
+                    reason,
+                    source: lastMarkdownRef.current,
+                    candidate: candidateMarkdown,
+                    canonical
+                  })
+                }
+              } else {
+                preparedSourceSync = postFallbackPrepared
+              }
+            }
+          }
+          // Apply the captured physical marker one final time immediately
+          // before publication. A deferred callback can first fail validation,
+          // retry from the previous source, and otherwise lose the correction
+          // even though the helper found the right canonical row. This final
+          // pass is local to the consumed intent and still requires semantic
+          // validation; it cannot normalize unrelated source blocks.
+          if (
+            preserved.preserved !== false &&
+            consumedInputIntentForIntegrity &&
+            Number.isFinite(pendingInputCanonicalOffset)
+          ) {
+            const corrected = restoreTypedBulletMarker({
+              markdown: preserved.markdown,
+              canonical,
+              previousCanonical: consumedInputIntentForIntegrity.canonical,
+              canonicalOffset: pendingInputCanonicalOffset,
+              marker: consumedInputIntentForIntegrity.marker
+            })
+            if (corrected !== preserved.markdown) {
+              const correctedResult = {
+                ...preserved,
+                markdown: corrected,
+                reason: 'final-typed-marker-restore',
+                integrityProof: null
+              }
+              const correctedPrepared = prepareSourceSyncCandidate(
+                correctedResult,
+                'final-typed-marker-restore'
+              )
+              if (correctedPrepared.validation.ok) {
+                preserved = { ...preserved, markdown: corrected, reason: 'final-typed-marker-restore' }
+                preparedSourceSync = correctedPrepared
+              }
+            }
+          }
+          if (pendingPlainParagraphPlan) {
+            tracePlainParagraphTransaction({
+              planned: pendingPlainParagraphPlan,
+              mode: plainTransactionMode,
+              legacyResult: preserved.preserved === false ? null : preserved,
+              publicationOwner: 'legacy',
+              authorityDecision: plainTransactionMode === 'authoritative'
+                ? pendingPlainParagraphPlan.ok
+                  ? 'authority-publication-rejected'
+                  : 'authority-transaction-rejected'
+                : 'authority-disabled',
+              authorityEligible: false
+            })
+          }
+          if (preserved.preserved === false) {
+            // STRUCTURAL (E0, 0.13.186 trace 15:48 + 0.13.190 trace 05:03):
+            // a preservation failure whose candidate IS the current source
+            // introduces no byte change — there is nothing new to commit and
+            // nothing new to warn about. The visible PM edit stays pending
+            // exactly like any unmapped result (a later callback or forced
+            // flush retries the cumulative delta); warning here reported a
+            // divergence the candidate itself proves was not introduced. The
+            // 15:48 chain fired five times via `blocked`; the 05:03 bulk
+            // selection delete (Cmd+A-style span incl. a code fence) exhausted
+            // every mapper with a no-op `visible-stream-mismatch` candidate
+            // the same way, so the hold covers ANY no-op rejection.
+            if (preserved.markdown === lastMarkdownRef.current) {
+              traceEditorEvent('no-op-preserve-held', {
+                reason: preserved.reason || null
+              })
+              userEditUntil = Date.now() + 1000
+              return
+            }
+            const scratchFallback = scratchCanonicalCandidate(
+              preserved.reason || 'unmapped-source-change'
+            )
+            if (scratchFallback) {
+              const coordinatedFallback = sourceSyncBridge.publishPrepared(
+                scratchFallback.prepared,
+                { notifyChange: true }
+              )
+              if (coordinatedFallback?.ok) {
+                traceEditorEvent('scratch-canonical-fallback', {
+                  trigger: scratchFallback.triggerReason,
+                  site: 'unmapped-preserve'
+                })
+                transactionSourcePendingPublish = false
+                transactionSourcePendingDoc = null
+                transactionSourceBlockHints = []
+                transactionSourceQuarantined = false
+                wholeDocumentReplacementPending = null
+                clearRichFlushPending()
+                pendingSourceSyncTransactionJournal = null
+                userEditUntil = Date.now() + 1000
+                return
+              }
+            }
+            reportSourceSyncFailure(preserved.reason || 'unmapped-source-change')
+            // The visible ProseMirror transaction is still real, but its raw
+            // Markdown ownership is ambiguous. Keep every pending intent and
+            // the dirty/flush flag alive; publishing the old source here would
+            // falsely mark the edit committed and let save resurrect stale
+            // bytes. A later callback or forced flush retries the cumulative
+            // delta against the same canonical baseline.
+            userEditUntil = Date.now() + 1000
+            return
+          }
+          // Legacy and allowlisted transaction candidates now share the same
+          // revision/proof-bound Publisher. The owner/family differ, but stale
+          // source/canonical/doc and duplicate publication are enforced once.
+          if (!preparedSourceSync) {
+            preparedSourceSync = prepareSourceSyncCandidate(
+              preserved,
+              'markdown-updated-final'
+            )
+          }
+          const coordinated = sourceSyncBridge.publishPrepared(
+            preparedSourceSync,
+            { notifyChange: true }
+          )
+          if (!coordinated?.ok) {
+            const reason = coordinated?.reason || 'source-document-mismatch'
+            const scratchFallback = scratchCanonicalCandidate(reason)
+            if (scratchFallback) {
+              const coordinatedFallback = sourceSyncBridge.publishPrepared(
+                scratchFallback.prepared,
+                { notifyChange: true }
+              )
+              if (coordinatedFallback?.ok) {
+                traceEditorEvent('scratch-canonical-fallback', {
+                  trigger: reason,
+                  site: 'publish-prepared'
+                })
+                transactionSourcePendingPublish = false
+                transactionSourcePendingDoc = null
+                transactionSourceBlockHints = []
+                transactionSourceQuarantined = false
+                wholeDocumentReplacementPending = null
+                clearRichFlushPending()
+                pendingSourceSyncTransactionJournal = null
+                userEditUntil = Date.now() + 1000
+                return
+              }
+            }
+            reportSourceSyncFailure(reason)
+            userEditUntil = Date.now() + 1000
+            return
+          }
+          transactionSourcePendingPublish = false
+          transactionSourcePendingDoc = null
+          transactionSourceBlockHints = []
+          transactionSourceQuarantined = false
+          wholeDocumentReplacementPending = null
+          clearRichFlushPending()
+          pendingRawMarkdownPasteRef.current = null
+          pendingListConversion = null
+          pendingSourceSyncTransactionJournal = null
+          if (Array.isArray(globalThis.__hmListIntentTrace)) {
+            globalThis.__hmListIntentTrace.push({
+              phase: 'publish',
+              reason: preserved.reason,
+              markdown: preserved.markdown
+            })
+          }
+          userEditUntil = Date.now() + 1000
+        }
+      }
+      // Typing-yield scheduling (P7c-latency, user report 2026-09-13): on a
+      // large document the sync pipeline (canonicalize + preserve + validate,
+      // ~1s+ measured on the 333K redis doc) runs on every markdownUpdated
+      // and saturates the main thread BETWEEN keystrokes — the user types and
+      // characters appear only after ~90ms+ per-key lag. IME composition
+      // already defers the whole callback for exactly this reason; extend the
+      // same policy to plain typing, ADAPTIVELY: only when the last pipeline
+      // run exceeded SYNC_DEFER_THRESHOLD_MS (small docs never defer), and
+      // only while the user is actively editing. The trailing idle timer
+      // processes the LATEST markdown (later callbacks reschedule it), with a
+      // hard cap so continuous typing still syncs periodically. Journals
+      // accumulate across revisions by design, and forced-flush boundaries
+      // (mode switch, save, export) process immediately — correctness is
+      // unchanged, only WHEN the idle-time pipeline runs.
+      let markdownSyncLastMs = 0
+      let markdownSyncDeferTimer = null
+      let markdownSyncDeferSince = 0
+      const SYNC_DEFER_THRESHOLD_MS = 150
+      const SYNC_DEFER_IDLE_MS = 600
+      const SYNC_DEFER_MAX_MS = 5000
+      cancelDeferredMarkdownSync = () => {
+        if (markdownSyncDeferTimer) clearTimeout(markdownSyncDeferTimer)
+        markdownSyncDeferTimer = null
+        markdownSyncDeferSince = 0
+      }
+      const runMarkdownSyncPipeline = (md) => {
+        // Immediate execution and forced flush invalidate older queued work.
+        cancelDeferredMarkdownSync()
+        const started = performance.now()
+        try {
+          handleMarkdownUpdatedImpl(null, md)
+        } finally {
+          markdownSyncLastMs = performance.now() - started
+        }
+      }
+      // Listen to `updated` (the document), not `markdownUpdated`: Milkdown
+      // serializes the whole document for markdownUpdated listeners on every
+      // 200 ms typing pause, even while a large document's sync is deferred
+      // and that string is never used (~0.5 s per pause on Windows). The
+      // document is serialized here only when the pipeline runs now (the
+      // memoized serializer, so the pipeline's own calls reuse it).
+      isMarkdownSyncPending = () => {
+        if (markdownSyncDeferTimer) return true
+        const doc = viewRef.current?.state.doc
+        // Milkdown only skips its callback when the document equals the one
+        // it delivered last (e.g. typed and reverted): then nothing is coming.
+        return Boolean(doc && deliveredDoc && doc !== deliveredDoc && !doc.eq(deliveredDoc))
+      }
+      api.updated((_ctx, doc) => {
+        deliveredDoc = doc
+        // Cold start: the FIRST callback on a large document must not pay the
+        // full pipeline synchronously just to learn it is heavy (CPU profile
+        // of the redis doc: whole-doc remark reparse dominates). Seed the
+        // metric from the document size; a real measurement replaces it after
+        // the first deferred run.
+        if (markdownSyncLastMs === 0 && doc?.content?.size > 100000) {
+          markdownSyncLastMs = 1000
+        }
+        // A large document stays deferred while typing even once its sync is
+        // fast (incremental parse): a sync per keystroke still costs more
+        // than one after the pause.
+        const heavyDocPipeline = markdownSyncLastMs > SYNC_DEFER_THRESHOLD_MS || isLargeSyncDocument(doc)
+        const activelyEditing = ready && !appending &&
+          !pendingRawMarkdownPasteRef.current && !wholeDocumentReplacementPending &&
+          !programmaticReplaceRef.current && !viewRef.current?.composing &&
+          hasRecentUserEdit()
+        if (heavyDocPipeline && activelyEditing) {
+          const overdue = markdownSyncDeferSince > 0 &&
+            Date.now() - markdownSyncDeferSince >= SYNC_DEFER_MAX_MS
+          if (!overdue) {
+            if (markdownSyncDeferTimer) clearTimeout(markdownSyncDeferTimer)
+            else markdownSyncDeferSince = Date.now()
+            markdownSyncDeferTimer = setTimeout(() => {
+              markdownSyncDeferTimer = null
+              markdownSyncDeferSince = 0
+              const view = viewRef.current
+              if (!view || view.composing || !richFlushPending) return
+              // PM may have advanced since Milkdown supplied this callback,
+              // even before its next callback arrives. Pair candidate bytes
+              // and expectedDoc from the SAME live document at execution time.
+              try {
+                const currentMarkdown = crepe.editor.ctx.get(serializerCtx)(view.state.doc)
+                runMarkdownSyncPipeline(currentMarkdown)
+              } catch {
+                reportSourceSyncFailure('deferred-source-serialization-failed')
+              }
+            }, SYNC_DEFER_IDLE_MS)
+            return
+          }
+          markdownSyncDeferSince = 0
+        }
+        let md
+        try {
+          md = crepe.editor.ctx.get(serializerCtx)(doc)
+        } catch {
+          reportSourceSyncFailure('source-serialization-failed')
+          return
+        }
+        runMarkdownSyncPipeline(md)
+      })
+      cleanups.push(() => cancelDeferredMarkdownSync())
+    })
+
+    const runCreate = () =>
+      crepe
+        .create()
+        .then(() => {
+          if (destroyed) {
+            crepe.destroy()
+            return
+          }
+          // Mark input rules fire only on what was just typed, never inside
+          // inline code (Milkdown's underscore rule lacked its `$` anchor).
+          try {
+            guardMarkInputRules(crepe.editor.ctx.get(inputRulesCtx), crepe.editor.ctx.get(schemaCtx))
+          } catch { /* keep Milkdown's rules */ }
+          // Reuse parses of the same Markdown across the sync's checks.
+          try {
+            crepe.editor.ctx.set(parserCtx, memoizeLastParses(crepe.editor.ctx.get(parserCtx)))
+          } catch { /* keep the plain parser */ }
+          // Serializing the whole document is ~0.4 s on a 350 KB file and one
+          // sync did it up to three times for the same document (Milkdown's
+          // listener, the flush, the validator). Documents are immutable, so
+          // the result is reused per document — and per serializer style
+          // object, which source-mode replaceMarkdown swaps out.
+          try {
+            const baseSerializer = crepe.editor.ctx.get(serializerCtx)
+            const serialized = new WeakMap()
+            // Milkdown's heading-id plugin follows every heading edit with a
+            // transaction that only rewrites heading `id`s, and the heading
+            // serializer writes `level` only: such a document serializes to
+            // the same bytes as the one before it. The sync used to
+            // serialize the whole document again for it twice (~0.1 s each
+            // on Windows for a 250 K-char file) on every heading change.
+            const recent = []
+            const incrementalSerializer = createIncrementalSerializer({
+              serialize: baseSerializer,
+              scheduleIdle: (run) => (typeof requestIdleCallback === 'function'
+                ? requestIdleCallback(run, { timeout: 2000 })
+                : setTimeout(run, 50)),
+              check: () => globalThis.__hmIncrementalSerializeCheck === true,
+              isPrimary: (doc) => doc === viewRef.current?.state.doc,
+              onMismatch: (report) => {
+                traceEditorEvent('incremental-serialize-mismatch', report)
+                if (globalThis.__hmIncrementalSerializeCheck === true) {
+                  fireToast(`增量序列化与整篇序列化不一致（${report.reason}）`, { sticky: true })
+                }
+              }
+            })
+            incrementalSerializerRef.current = incrementalSerializer
+            cleanups.push(() => incrementalSerializer.dispose())
+            fullSerializerRef.current = baseSerializer
+            // Diagnostics (perf benches): every open editor's counters. The
+            // entry is removed on destroy — it captures this editor, so a
+            // closed tab would otherwise keep its whole editor alive.
+            const diagnostics = {
+              stats: incrementalSerializer.stats,
+              children: () => viewRef.current?.state.doc.childCount ?? 0
+            }
+            ;(globalThis.__hmIncrementalSerializeAll ??= []).push(diagnostics)
+            cleanups.push(() => {
+              const all = globalThis.__hmIncrementalSerializeAll
+              const index = all ? all.indexOf(diagnostics) : -1
+              if (index >= 0) all.splice(index, 1)
+            })
+            const memoSerializer = (doc) => {
+              const keyed = doc && typeof doc === 'object'
+              const style = serializerStyleHolder.style
+              const hit = keyed ? serialized.get(doc) : null
+              if (hit && hit.style === style) return hit.markdown
+              if (keyed) {
+                const twin = recent.find((entry) => entry.style === style && entry.doc.deref?.() && sameIgnoringHeadingIds(entry.doc.deref(), doc))
+                if (twin) {
+                  serialized.set(doc, { style, markdown: twin.markdown })
+                  incrementalSerializer.adoptEquivalent(twin.doc.deref(), doc)
+                  return twin.markdown
+                }
+              }
+              // Large documents: only the changed blocks are serialized again
+              // (lib/incremental-serialize.js; proven per call, else full).
+              const markdown = keyed ? incrementalSerializer.serialize(doc, style) : baseSerializer(doc)
+              if (keyed) {
+                serialized.set(doc, { style, markdown })
+                recent.unshift({ doc: new WeakRef(doc), style, markdown })
+                recent.length = Math.min(recent.length, 2)
+              }
+              return markdown
+            }
+            crepe.editor.ctx.set(serializerCtx, memoSerializer)
+          } catch { /* keep the plain serializer */ }
+
+          // P7 root fix: mirror the authored list spelling in the serializer
+          // (bullet, ordered delimiter, loose/tight, hard-break, strong). The
+          // serializer's defaults (`*`, padded, `1)`) made every authored
+          // compact `-`/`1.` document permanently diverge from its own
+          // canonical form, which is the structural source of the whole
+          // "diverged list" warning family. Style application is per editor
+          // instance; source-mode replaceMarkdown() re-detects on new bytes.
+          try {
+            const styledRemark = crepe.editor.ctx.get(remarkCtx)
+            applySerializerStyleToRemark(styledRemark, serializerStyleHolder)
+          } catch {
+            /* keep the stock serializer if the context is unavailable */
+          }
+        // Milkdown stores the ProseMirror view in its context — `editor.view`
+        // does not exist in this version, which previously left `view`
+        // undefined and silently disabled every view-dependent feature.
+        let view
+        try {
+          view = crepe.editor.ctx.get(editorViewCtx)
+        } catch {
+          view = crepe.editor?.view
+        }
+        viewRef.current = view
+
+        // Issue #10 (belt-and-suspenders): guarantee the inline-code mark is
+        // non-inclusive on the live schema, in case Crepe's plugin order left the
+        // extendSchema override (above) ineffective. ResolvedPos.marks() reads
+        // `mark.type.spec.inclusive === false` to drop the mark at a span's end,
+        // so the caret exits `code` on the next character either way.
+        try {
+          const icMark = view?.state.schema.marks.inlineCode
+          if (icMark && icMark.spec.inclusive !== false) icMark.spec.inclusive = false
+        } catch {
+          /* schema shape changed — extendSchema override still applies */
+        }
+
+        // Typora-theme hooks: most Typora themes target `#write` (the content
+        // container) and `.markdown-body`. Tagging the ProseMirror element with
+        // both lets a migrated Typora CSS style our editor. (Several editors can
+        // be mounted at once, so `id="write"` may repeat — invalid HTML but
+        // harmless: CSS `#write` still matches all, and we never getElementById it.)
+        if (view?.dom) {
+          view.dom.id = 'write'
+          view.dom.classList.add('markdown-body')
+          // English spell-check (red wavy underline) on the contenteditable.
+          // Default off (settings.spellcheck). Other surfaces (source textarea,
+          // inputs) opt out individually via spellCheck={false}.
+          view.dom.setAttribute('spellcheck', spellcheckRef.current ? 'true' : 'false')
+          view.dom.setAttribute('aria-readonly', readOnlyRef.current ? 'true' : 'false')
+          // Keep the freshly-created DOM non-editable until its canonical
+          // source baseline has been captured below. See interactionReadyRef.
+          try { view.setProps({ editable: () => interactionReadyRef.current && !readOnlyRef.current }) } catch { /* */ }
+          view.dom.contentEditable = 'false'
+          view.dom.dataset.horsemdReady = 'false'
+        }
+
+        // Content is in the DOM now — remove the loading skeleton SYNCHRONOUSLY
+        // (flushSync) so it's gone before the heavy getMarkdown + onChange work
+        // below. A plain setState here would be batched and its repaint blocked by
+        // that work, leaving the skeleton visibly overlapping the rendered text
+        // for hundreds of ms (worse when toggling source↔rich on a big doc).
+        flushSync(() => setLoaded(true))
+
+        mountEditorDomBindings({
+          view,
+          viewRef,
+          host,
+          docPath,
+          crepe,
+          liveEditors,
+          self,
+          cleanups,
+          markUserEdit,
+          onRichEditPending: (delayMs) => {
+            onRichEditPending?.()
+            scheduleRichDirtyReconcile(delayMs)
+          },
+          insertUploadedImage,
+          prepareRawMarkdownPaste: ({ markdown, from, to }) => {
+            const source = lastMarkdownRef.current || ''
+            const canonical = canonicalMarkdownRef.current || ''
+            const oldDoc = view.state.doc
+            let next = markdown
+            const replacesWholeDocument = from <= 1 && to >= oldDoc.content.size
+            if (source && !replacesWholeDocument) {
+              try {
+                const remark = crepe.editor.ctx.get(remarkCtx)
+                const rawFrom = pmPosToMarkdownOffset(source, from, view.state.doc, remark)
+                const rawTo = pmPosToMarkdownOffset(source, to, view.state.doc, remark)
+                if (!Number.isFinite(rawFrom) || !Number.isFinite(rawTo)) return null
+                // Never between the CR and LF of a line ending (a mapped
+                // offset can land there in a CRLF file: `正文。\r` + paste).
+                const outsideCrlf = (offset) => (source[offset - 1] === '\r' && source[offset] === '\n' ? offset - 1 : offset)
+                const start = outsideCrlf(Math.min(rawFrom, rawTo))
+                const end = outsideCrlf(Math.max(rawFrom, rawTo))
+                let before = source.slice(0, start)
+                let after = source.slice(end)
+                // The pasted lines take the line ending of the line they land
+                // on (the clipboard's own made a CRLF file mixed, #171).
+                const eol = localLineEnding(source, start)
+                const pasted = markdown.replace(/\r?\n/g, eol)
+                // Pasted into an empty top-level paragraph (a new line after
+                // Enter): that line has no bytes in the source, so the paste
+                // landed right against the block before it (`尾段\n## 标题`).
+                // The pasted blocks get a blank line on each side (Typora).
+                const $from = oldDoc.resolve(from)
+                if (from === to && $from.depth === 1 && $from.parent.type.name === 'paragraph' && !$from.parent.content.size) {
+                  if (before.trim()) before = before.replace(/[ \t]*(?:\r?\n[ \t]*)*$/, '') + eol + eol
+                  const tail = after.replace(/^(?:[ \t]*\r?\n)+/, '')
+                  after = tail.trim() ? eol + eol + tail : (/\n$/.test(source) ? eol : '')
+                  next = before + pasted.replace(/(?:\r?\n)+$/, '') + after
+                } else {
+                  next = before + pasted + after
+                }
+              } catch {
+                return null
+              }
+            }
+            const captured = documentReplacementSourceSyncOwner.captureRawMarkdownPaste({
+              source,
+              canonical,
+              oldDoc,
+              markdown: next,
+              from,
+              to,
+              replacesWholeDocument
+            })
+            if (!captured.ok) return null
+            const pending = captured.token
+            pendingRawMarkdownPasteRef.current = pending
+            return () => {
+              if (pendingRawMarkdownPasteRef.current === pending) {
+                pendingRawMarkdownPasteRef.current = null
+              }
+            }
+          },
+          reportActiveBlock,
+          setBlock,
+          canConvertBlockToList,
+          getListConversionContext,
+          setCtxMenu,
+          setZoom,
+          getT: (key) => tRef.current(key),
+          getKeybindings: () => effectiveKeybindingsRef.current,
+          getSelectionToolbarEnabled: () => selectionToolbarRef.current,
+          onMarkdownInputIntent: (intent) => {
+            const currentView = viewRef.current
+            let sourceOffset = null
+            let sourceSlotRawStart = null
+            try {
+              const remark = crepe.editor.ctx.get(remarkCtx)
+              sourceOffset = pmPosToMarkdownOffset(
+                lastMarkdownRef.current,
+                currentView?.state.selection.head,
+                currentView?.state.doc,
+                remark
+              )
+              const $from = currentView?.state.selection.$from
+              const topStart = $from?.depth >= 1 ? $from.before(1) : null
+              const slot = transactionSourceBlockHints
+                .find((candidate) => candidate.pmBlockStart === topStart)
+              if (slot) sourceSlotRawStart = slot.rawStart
+              // In release mode transaction block hints are intentionally not
+              // collected. A list marker typed in the final top-level empty
+              // paragraph still has one exact raw owner: the document tail.
+              // Record that boundary instead of trusting a visible-text
+              // lookup, which can select an earlier duplicate sentence in a
+              // long document (123321.md repeatedly contains “测试”).
+              const topIndex = $from?.index?.(0)
+              const ownsTopLevelPlaceholder =
+                $from?.depth === 1 &&
+                $from?.parent?.type?.name === 'paragraph'
+              const followingTopBlocksAreEmpty = Number.isFinite(topIndex) &&
+                Array.from(
+                  { length: Math.max(0, currentView.state.doc.childCount - topIndex - 1) },
+                  (_, offset) => currentView.state.doc.child(topIndex + offset + 1)
+                ).every((node) => !node.textContent)
+              if (
+                !Number.isFinite(sourceSlotRawStart) &&
+                ownsTopLevelPlaceholder &&
+                followingTopBlocksAreEmpty
+              ) {
+                sourceSlotRawStart = lastMarkdownRef.current.length
+              }
+            } catch {
+              // The input rule will still take the generic preservation path.
+            }
+            pendingMarkdownInputIntent = {
+              ...intent,
+              at: Date.now(),
+              pmPos: currentView?.state.selection.head,
+              canonical: canonicalMarkdownRef.current,
+              source: lastMarkdownRef.current,
+              sourceOffset,
+              sourceSlotRawStart,
+              batchUntil: Date.now() + 3000
+            }
+            if (Array.isArray(globalThis.__hmListIntentTrace)) {
+              globalThis.__hmListIntentTrace.push({
+                marker: intent.marker,
+                sourceOffset,
+                sourceSlotRawStart,
+                pmPos: currentView?.state.selection.head,
+                topIndex,
+                ownsTopLevelPlaceholder,
+                topChildCount: currentView?.state.doc.childCount,
+                followingTopBlocksAreEmpty,
+                sourceLength: lastMarkdownRef.current.length,
+                canonical: canonicalMarkdownRef.current
+              })
+            }
+            // Intents are valid only against the source snapshot in which the
+            // marker was captured. A previous list input can remain in the
+            // queue when its markdownUpdated callback is deferred; if the user
+            // then edits another block and starts a new list, carrying that old
+            // intent forward lets it rewrite the new list with stale offsets
+            // and serializer defaults (`1`, `-`, `*`, and a phantom next row).
+            // Keep multiple intents only when they belong to the same current
+            // source snapshot (the outer + nested input-rule batch case).
+            pendingMarkdownInputIntents = [
+              ...pendingMarkdownInputIntents.filter((pending) =>
+                isActiveListInputIntent(pending) &&
+                pending.source === lastMarkdownRef.current
+              ),
+
+              pendingMarkdownInputIntent
+            ]
+            if (Array.isArray(globalThis.__hmListIntentTrace)) {
+              globalThis.__hmListIntentTrace.push({
+                phase: 'prune-stale-input-intents',
+                kept: pendingMarkdownInputIntents.length,
+                sourceLength: lastMarkdownRef.current.length
+              })
+            }
+            traceEditorEvent('markdown-input-intent', pendingMarkdownInputIntent)
+          },
+          isReadOnly: () => readOnlyRef.current,
+          isDestroyed: () => destroyed
+        })
+
+        mountEditorInputTrace({
+          host,
+          view,
+          cleanups
+        })
+        mountSyncEventLog({ view, log: syncEventLog, cleanups })
+
+        // Typora-style new document: first line is an empty Heading 1 (title),
+        // with an empty paragraph below it. The title is there if you want it,
+        // but the body block lets you skip the title and start writing straight
+        // away (click it or press ↓). Done before the baseline below so the new
+        // tab isn't marked dirty.
+        if (view && !readOnlyRef.current) {
+          const { state } = view
+          const doc = state.doc
+          const first = doc.firstChild
+          const headingType = state.schema.nodes.heading
+          const paragraphType = state.schema.nodes.paragraph
+          if (
+            headingType &&
+            paragraphType &&
+            doc.childCount === 1 &&
+            first &&
+            first.type.name === 'paragraph' &&
+            first.content.size === 0
+          ) {
+            hasSyntheticEmptyTitle = true
+            let tr = state.tr.setNodeMarkup(0, headingType, { level: 1 })
+            tr = tr.insert(tr.doc.content.size, paragraphType.create())
+            // Leave the cursor in the title; the body paragraph is one ↓ / click away.
+            tr = tr.setSelection(TextSelection.create(tr.doc, 1))
+            view.dispatch(tr)
+          }
+        }
+
+        const api = createEditorApi({
+          viewRef,
+          crepe,
+          crepeRef,
+          lastMarkdownRef,
+          canonicalMarkdownRef,
+          programmaticReplaceRef,
+          serializerStyleHolder,
+          hasPendingRichFlush: () => richFlushPending,
+          clearPendingRichFlush: clearRichFlushPending,
+          // ProseMirror documents are immutable: the same object means not a
+          // single change since the Coordinator verified the source for it.
+          isLiveDocCommitted: () => {
+            if (!ready || generatedScratchRef.current) return false
+            const doc = viewRef.current?.state.doc
+            if (!doc) return false
+            // Equal content (Node.eq: same types, attrs, marks and text) has
+            // the same Markdown, e.g. a character typed and deleted again.
+            const pairs = (pair) => Boolean(pair?.doc && (pair.doc === doc || pair.doc.eq(doc)) &&
+              pair.source === lastMarkdownRef.current &&
+              pair.canonical === canonicalMarkdownRef.current)
+            return pairs(sourceSyncBridge?.getSnapshot?.()) || pairs(verifiedLiveDoc)
+          },
+          // The flush's full committed-baseline check passed for this exact
+          // document (covers the opened file before any publish).
+          noteVerifiedLiveDoc: (doc, source, canonical) => { verifiedLiveDoc = { doc, source, canonical } },
+          recordSourceSnapshot: sourceSnapshotHistory.record,
+          generatedScratchRef,
+          getGeneratedScratchMarkdown: (canonical) => generatedScratchMarkdownForCanonical(canonical, true),
+          canonicalForSource,
+          setBlock,
+          markUserEdit,
+          onStructureChange,
+          isDestroyed: () => destroyed,
+          getT: (key) => tRef.current(key),
+          notify: fireToast,
+          validateSourceCandidate,
+          publishSourceSyncResult,
+          publishPendingTransactionJournal,
+          publishReprint: ({ canonical }) => hasBlockingListInputIntent() || pendingRawMarkdownPasteRef.current || pendingListConversion
+            ? null
+            : publishReprint({ canonical, boundary: 'source-reprint-forced-flush', notifyChange: false }),
+          rescueReprint: ({ canonical }) => publishReprint({ canonical, boundary: 'source-reprint-rescue', notifyChange: false, allowDegraded: true }),
+          reportSourceSyncFailure
+        })
+        api.convertList = convertList
+        api.convertBlockToList = convertBlockToList
+        const {
+          getPdfSource,
+          getMarkdown,
+          toggleHighlight,
+          applyReviewMarkup,
+          replaceMarkdown,
+          flushMarkdown,
+          flushMarkdownSettled,
+          getRecoveryMarkdown,
+          restoreMarkdownOffset,
+          markdownOffsetFromSelection,
+          markdownOffsetFromViewportTop
+        } = api
+        apiRef.current = api
+        // DEV-only CDP test hook (scripts/test-substitution.mjs). Exposes the
+        // active editor so the harness can drive the REAL 替换 command, read
+        // markdown, and simulate a markdown paste (parser + remark plugins, so
+        // `{~~old~>new~~}` reconstructs like a real paste). Stripped in prod
+        // builds (import.meta.env.DEV is false after `npm run build`).
+        if (import.meta.env && import.meta.env.DEV) {
+          window.__horsemd = Object.assign(window.__horsemd || {}, {
+            getView: () => viewRef.current,
+            getMarkdown,
+            applyReviewMarkup,
+            focus: () => {
+              viewRef.current && viewRef.current.focus()
+              return true
+            },
+            selectRange: (from, to) => {
+              const v = viewRef.current
+              if (!v) return 'no-view'
+              v.dispatch(v.state.tr.setSelection(TextSelection.create(v.state.doc, from, to)))
+              v.focus()
+              return true
+            },
+            clear: () => {
+              const v = viewRef.current
+              if (!v) return 'no-view'
+              v.dispatch(v.state.tr.delete(0, v.state.doc.content.size))
+              return true
+            },
+            cursorEnd: () => {
+              const v = viewRef.current
+              if (!v) return 'no-view'
+              const end = v.state.doc.content.size
+              v.dispatch(
+                v.state.tr
+                  .setSelection(TextSelection.near(v.state.doc.resolve(end), -1))
+                  .scrollIntoView()
+              )
+              v.focus()
+              return end
+            },
+            getHtml: () => {
+              const v = viewRef.current
+              return v ? v.dom.innerHTML : 'no-view'
+            },
+            pasteMarkdown: (md) => {
+              const v = viewRef.current
+              if (!v) return 'no-view'
+              try {
+                const parser = crepe.editor.ctx.get(parserCtx)
+                const parsed = parser(md)
+                const endPos = v.state.doc.content.size
+                v.dispatch(v.state.tr.insert(endPos, parsed.content).scrollIntoView())
+                return true
+              } catch (e) {
+                return 'err:' + (e && e.message ? e.message : e)
+              }
+            }
+          })
+        }
+        onReady?.({
+          setBlock,
+          getView: () => viewRef.current,
+          getPdfSource,
+          getMarkdown,
+          toggleHighlight,
+          applyReviewMarkup,
+          replaceMarkdown,
+          flushMarkdown,
+          flushMarkdownSettled,
+          getRecoveryMarkdown,
+          getSyncReport: (where) => captureSyncReport('rich-edit-not-mapped', where),
+          restoreMarkdownOffset,
+          markdownOffsetFromSelection,
+          markdownOffsetFromViewportTop
+        })
+
+        // Append the remaining chunks of a huge doc in the background so the open
+        // never freezes the main thread. The editor is read-only during load to
+        // avoid edit/append races; restored after. Yields via setTimeout (NOT
+        // requestIdleCallback — that stops firing when the window is occluded,
+        // which would leave the final yield pending and the editor read-only).
+        // Record Crepe's canonical baseline without replacing the tab's original
+        // source. Opening a rich document must never add blank lines, escapes,
+        // or list-marker changes before the user edits anything.
+        const finishInitial = (recordCanonical) => {
+          if (destroyed) return
+          if (recordCanonical) {
+            try {
+              // Source-mode switches and saves serialize `view.state.doc`
+              // through serializerCtx (see editor-api.js). Capture the initial
+              // baseline through that exact path too: Crepe's cached
+              // getMarkdown() can differ in trailing list newlines, making a
+              // no-op source switch look like an edit and rewrite source bytes.
+              const serializer = crepe.editor.ctx.get(serializerCtx)
+              canonicalMarkdownRef.current = canonicalForSource(serializer(view.state.doc))
+            } catch {
+              try {
+                canonicalMarkdownRef.current = canonicalForSource(crepe.getMarkdown())
+              } catch { /* editor teardown */ }
+            }
+          }
+          sourceIntegrityCheckpoints.trust(
+            lastMarkdownRef.current,
+            canonicalMarkdownRef.current,
+            { owner: 'bootstrap', reason: 'initial-editor-source-pair' }
+          )
+          ready = true
+          if (!deliveredDoc) deliveredDoc = viewRef.current?.state.doc || null
+          interactionReadyRef.current = true
+          // Large documents: warm the sync caches while idle after opening.
+          // The first edit's sync would otherwise parse the whole committed
+          // source and compute every block's comparison form (~0.3 s for a
+          // 350 KB Yuque export on an M-series Mac). Skipped once editing has
+          // started (that sync fills the same caches).
+          if (isLargeSyncDocument(view.state.doc)) {
+            const warm = () => {
+              globalThis.__hmSyncWarmup = { at: Date.now(), skipped: true }
+              if (destroyed || hasRecentUserEdit() || viewRef.current?.composing) return
+              const started = performance.now()
+              globalThis.__hmSyncWarmup.skipped = false
+              try {
+                const source = String(lastMarkdownRef.current ?? '').replace(/^\uFEFF/, '')
+                if (!source) return
+                const entry = parseMarkdownCached(crepe.editor.ctx.get(remarkCtx), crepe.editor.ctx.get(schemaCtx), source)
+                const liveDoc = viewRef.current?.state.doc
+                if (liveDoc && entry?.srcDoc) {
+                  areSourceDocumentsEquivalent(entry.srcDoc, liveDoc, {
+                    ignoreAllTableColumnWidths: true,
+                    ignoreEmptyContainerParagraphs: true,
+                    recordDifference: false
+                  })
+                }
+              } catch { /* warm-up only */ }
+              globalThis.__hmSyncWarmup.ms = Math.round(performance.now() - started)
+            }
+            const warmTimer = setTimeout(() => {
+              if (typeof requestIdleCallback === 'function') requestIdleCallback(warm, { timeout: 3000 })
+              else warm()
+            }, 1000)
+            cleanups.push(() => clearTimeout(warmTimer))
+          }
+          // Test-only harness for the source reprint engine (R1, see
+          // docs/source-reprint-architecture.md): the real Crepe parser,
+          // serializer and remark chain, exposed only under input trace.
+          if (window.api?.inputTraceEnabled === true) {
+            const harness = globalThis.__hmSourceReprintHarness = {
+              parse: (markdown) => crepe.editor.ctx.get(parserCtx)(markdown),
+              // Sync diagnostics test (test:sync-report-ui): a failure that
+              // skips the degraded rescue, as a real unmappable edit would,
+              // with the source left at its last synced state (`staleSource`).
+              forceSyncFailure: (reason, staleSource) => {
+                if (typeof staleSource === 'string') lastMarkdownRef.current = staleSource
+                return reportSourceSyncFailure(reason, { rescue: false })
+              },
+              parseTree: (markdown) => { const r = crepe.editor.ctx.get(remarkCtx); return reprintDeps().parseTree(r.runSync(r.parse(markdown), markdown)) },
+              serialize: (doc) => crepe.editor.ctx.get(serializerCtx)(doc),
+              remark: () => crepe.editor.ctx.get(remarkCtx),
+              schema: () => view.state.schema,
+              liveDoc: () => viewRef.current?.state.doc,
+              docFromJSON: (json) => view.state.schema.nodeFromJSON(json),
+              liveSource: () => lastMarkdownRef.current,
+              equivalent: (markdown, doc) => validateTransactionMarkdown({ markdown, expectedDoc: doc }) === true,
+              reprint: (source, doc, previousDoc = null) => reprintVerified({ ...reprintDeps(), source, editorDoc: doc, previousDoc })
+              ,
+              // Incremental serialization (lib/incremental-serialize.js):
+              // counters, and serialize a document through it (the test then
+              // compares with `serialize` of a fresh full serializer).
+              incrementalSerializeStats: () => ({ ...incrementalSerializerRef.current?.stats, enabled: incrementalSerializerRef.current?.enabled }),
+              serializeFull: (doc) => fullSerializerRef.current?.(doc),
+              newTransform: (doc) => new Transform(doc),
+              // Start over from the live document (as after opening it).
+              incrementalSerializeRebase: () => {
+                const live = viewRef.current?.state.doc
+                incrementalSerializerRef.current?.forget()
+                return live ? incrementalSerializerRef.current?.serialize(live, serializerStyleHolder.style)?.length : null
+              },
+              // Differential check of the incremental parse: each text is
+              // parsed incrementally from the previous RESULT (so splices
+              // build on splices) and compared with a full parse.
+              incrementalParseChain: (texts) => {
+                const remark = crepe.editor.ctx.get(remarkCtx)
+                const schema = view.state.schema
+                let base = parseMarkdownFull(remark, schema, texts[0])
+                const out = { used: 0, full: 0, mismatches: [] }
+                for (let index = 1; index < texts.length; index += 1) {
+                  const markdown = texts[index]
+                  const full = parseMarkdownFull(remark, schema, markdown)
+                  let entry = null
+                  try { entry = incrementalParse(base, markdown, remark, schema) } catch (error) { out.mismatches.push({ index, threw: String(error?.stack || error).slice(0, 400) }) }
+                  if (!entry) { out.full += 1; base = full; continue }
+                  out.used += 1
+                  const docSame = full.srcDoc.eq(entry.srcDoc)
+                  const treeSame = JSON.stringify(full.mdRoot) === JSON.stringify(entry.mdRoot)
+                  const countsSame = JSON.stringify(full.counts) === JSON.stringify(entry.counts)
+                  if (!docSame || !treeSame || !countsSame) {
+                    out.mismatches.push({ index, docSame, treeSame, countsSame, previous: texts[index - 1], markdown })
+                    base = full
+                  } else base = entry
+                }
+                return out
+              },
+              debugIncremental: (previous, markdown) => {
+                const remark = crepe.editor.ctx.get(remarkCtx)
+                const schema = view.state.schema
+                const base = parseMarkdownFull(remark, schema, previous)
+                const entry = incrementalParse(base, markdown, remark, schema)
+                const full = parseMarkdownFull(remark, schema, markdown)
+                if (!entry) return { used: false }
+                const strip = (n) => JSON.stringify(n, (k, v) => (k === 'position' ? undefined : v))
+                const kids = (root) => root.children.map((c) => ({ type: c.type, s: c.position?.start?.offset, e: c.position?.end?.offset }))
+                const fk = full.mdRoot.children, ek = entry.mdRoot.children
+                let first = -1
+                for (let i = 0; i < Math.max(fk.length, ek.length); i += 1) if (JSON.stringify(fk[i]) !== JSON.stringify(ek[i])) { first = i; break }
+                return { window: entry.incremental, first, fullKid: fk[first] && { type: fk[first].type, pos: fk[first].position, text: markdown.slice(fk[first].position?.start?.offset, fk[first].position?.end?.offset).slice(0, 300), sameNoPos: strip(fk[first]) === strip(ek[first]) }, incKid: ek[first] && { type: ek[first].type, pos: ek[first].position, text: markdown.slice(ek[first].position?.start?.offset, ek[first].position?.end?.offset).slice(0, 300) }, fullKids: kids(full.mdRoot).slice(Math.max(0, first - 3), first + 3), incKids: kids(entry.mdRoot).slice(Math.max(0, first - 3), first + 3), baseKids: kids(base.mdRoot) }
+              },
+              semanticMemoCheck: (left, right, options = {}) => {
+                const previous = globalThis.__hmSemanticMemoCheck
+                globalThis.__hmSemanticMemoCheck = true
+                const before = (globalThis.__hmSemanticMemoMismatch || []).length
+                try { areSourceDocumentsEquivalent(left, right, options) } finally { globalThis.__hmSemanticMemoCheck = previous }
+                return (globalThis.__hmSemanticMemoMismatch || []).length === before
+              }
+            }
+            // It captures this editor: drop it with the editor (a closed tab
+            // must not stay in memory through it).
+            cleanups.push(() => {
+              if (globalThis.__hmSourceReprintHarness === harness) delete globalThis.__hmSourceReprintHarness
+            })
+          }
+          try { view.setProps({ editable: () => !readOnlyRef.current }) } catch { /* editor teardown */ }
+          if (view.dom) {
+            view.dom.contentEditable = readOnlyRef.current ? 'false' : 'true'
+            view.dom.setAttribute('aria-readonly', readOnlyRef.current ? 'true' : 'false')
+            view.dom.dataset.horsemdReady = 'true'
+          }
+          reportActiveBlock()
+        }
+        if (chunks) {
+          // chunks[0] is already rendered; append the rest in the background,
+          // then finish (no rebase). `appending` suppresses onChange while the
+          // doc streams in (see the markdownUpdated handler) — managed here, not
+          // inside appendChunks, so the flag stays in this closure.
+          const rest = chunks.slice(1)
+          if (rest.length) appending = true
+          appendChunks({
+            rest,
+            view,
+            getParser: () => { try { return crepe.editor.ctx.get(parserCtx) } catch { return null } },
+            isDestroyed: () => destroyed,
+            getEditable: () => !readOnlyRef.current,
+            onLoadingChange,
+            onStructureChange
+          }).then(() => {
+            if (rest.length) appending = false
+            // Source preservation needs the serializer snapshot of the complete
+            // document before the first user transaction. Recording it does not
+            // rebase or write the authored Markdown; without it, the first rich
+            // edit after chunked loading is conservatively discarded because the
+            // mapper has no previous canonical state to compare against.
+            if (!destroyed) finishInitial(true)
+          })
+        } else if (isLargeDoc) {
+          requestAnimationFrame(() => requestAnimationFrame(() => finishInitial(true)))
+        } else {
+          finishInitial(true)
+        }
+      })
+      .catch((err) => console.error('Crepe init failed', err))
+
+    // For large docs, defer create() past a paint so the loading skeleton is
+    // actually shown before create() blocks the main thread parsing/rendering —
+    // otherwise switching to (or first opening) a big tab freezes on the
+    // previous view with no feedback. Small docs create immediately.
+    if (isLargeDoc) {
+      createRaf = requestAnimationFrame(() => {
+        createRaf = requestAnimationFrame(() => {
+          if (!destroyed) runCreate()
+        })
+      })
+    } else {
+      runCreate()
+    }
+
+    return () => {
+      destroyed = true
+      if (createRaf) cancelAnimationFrame(createRaf)
+      if (richDirtyReconcileTimer) clearTimeout(richDirtyReconcileTimer)
+      cleanups.forEach((fn) => {
+        try {
+          fn()
+        } catch {
+          /* ignore */
+        }
+      })
+      viewRef.current = null
+      crepeRef.current = null
+      try {
+        crepe.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Re-localize the image caption / upload text when the language changes. The
+  // editor isn't re-created, so we (1) update the config for images rendered
+  // later, and (2) patch the placeholder on any caption inputs already in the
+  // DOM — the image-block component caches the config and won't re-read it.
+  useEffect(() => {
+    const crepe = crepeRef.current
+    if (crepe) {
+      try {
+        crepe.editor.action((ctx) => applyImageText(ctx, t))
+      } catch {
+        /* editor not ready yet */
+      }
+    }
+    const root = hostRef.current
+    if (root) {
+      root.querySelectorAll('input.caption-input').forEach((inp) => {
+        inp.placeholder = t('image.caption')
+      })
+    }
+  }, [t])
+
+  // The floating bar and context menu reuse the same conversion path as the
+  // keyboard shortcuts (defined inside the effect, reached through apiRef).
+  const pickBlock = (id) => {
+    const changed = apiRef.current?.setBlock(id, ctxMenu?.blockPos) === true
+    if (!changed) setCtxMenu(null)
+    return changed
+  }
+  const pickHeadingFold = (meta) => {
+    setCtxMenu(null)
+    runHeadingFold(viewRef.current, meta)
+  }
+  const pickListConversion = (targetType, listPos, anchorPos) =>
+    apiRef.current?.convertList(targetType, listPos, anchorPos)
+  const pickBlockListConversion = (targetType, blockPos) => apiRef.current?.convertBlockToList(targetType, blockPos)
+  const pickTextFormat = (format, selection) => {
+    const applied = apiRef.current?.applyTextFormat(format, selection)
+    if (applied) setCtxMenu(null)
+    return applied
+  }
+  const pickReviewMarkup = (kind, selection) => {
+    const applied = apiRef.current?.applyReviewMarkup(kind, selection)
+    if (applied) setCtxMenu(null)
+    return applied
+  }
+
+  return (
+    <>
+      {/* Placeholder text is baked into the Crepe editor at create() and won't
+          follow a language switch. Expose the current translation as a CSS var
+          (re-rendered on lang change) and let CSS prefer it over the editor's
+          static data-placeholder. */}
+      <div
+        className="editor-host"
+        ref={hostRef}
+        style={{ '--hm-placeholder': JSON.stringify(t('editor.placeholder')) }}
+      />
+
+      {/* Loading skeleton — pulsing gray bars shown while a large document is
+          still parsing/rendering. Gated on document size so small files (which
+          load instantly) never flash a placeholder. */}
+      {!loaded && isLargeDoc && (
+        <div className="editor-skeleton" aria-hidden="true">
+          <div className="skel-line skel-title" />
+          <div className="skel-line" style={{ width: '94%' }} />
+          <div className="skel-line" style={{ width: '99%' }} />
+          <div className="skel-line" style={{ width: '86%' }} />
+          <div className="skel-line skel-gap" style={{ width: '64%' }} />
+          <div className="skel-line" style={{ width: '97%' }} />
+          <div className="skel-line" style={{ width: '90%' }} />
+          <div className="skel-line" style={{ width: '72%' }} />
+          <div className="skel-line skel-gap" style={{ width: '50%' }} />
+          <div className="skel-line" style={{ width: '93%' }} />
+          <div className="skel-line" style={{ width: '80%' }} />
+        </div>
+      )}
+
+      {ctxMenu && (
+        <>
+          <div className="menu-backdrop" onMouseDown={() => setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null) }} />
+          <div className={`block-ctxmenu${ctxMenu.x > window.innerWidth - 410 ? ' block-ctxmenu-submenus-left' : ''}`} style={{
+            left: Math.min(ctxMenu.x, window.innerWidth - 210),
+            top: Math.max(8, Math.min(ctxMenu.y, window.innerHeight - 360))
+          }}>
+            <button
+              className="block-menu-item"
+              data-context-copy
+              disabled={!ctxMenu.copySelection}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                const copied = ctxMenu.copySelection?.copy() === true
+                setCtxMenu(null)
+                if (!copied) fireToast(t('editor.copyFailed'))
+              }}
+            >
+              <span className="block-menu-short" aria-hidden="true">⧉</span>
+              <span className="block-menu-name">{t('editor.copy')}</span>
+              <span className="block-menu-sc">{window.api?.platform === 'darwin' ? '⌘C' : 'Ctrl+C'}</span>
+            </button>
+            <button
+              className="block-menu-item"
+              data-context-copy-plain
+              disabled={!ctxMenu.copySelection}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                const copied = ctxMenu.copySelection?.copy({ plainOnly: true }) === true
+                setCtxMenu(null)
+                if (!copied) fireToast(t('editor.copyFailed'))
+              }}
+            >
+              <span className="block-menu-short" aria-hidden="true">T</span>
+              <span className="block-menu-name">{t('editor.copyPlain')}</span>
+            </button>
+            {ctxMenu.headingFold && (ctxMenu.headingFold.foldable || ctxMenu.headingFold.anyFolded) && (
+              <>
+                <div className="block-menu-divider" />
+                {ctxMenu.headingFold.foldable && (
+                  <button
+                    className="block-menu-item"
+                    data-heading-fold="toggle"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => pickHeadingFold({ action: 'toggle', pos: ctxMenu.headingFold.pos })}
+                  >
+                    <span className="block-menu-short" aria-hidden="true">{ctxMenu.headingFold.folded ? '▸' : '▾'}</span>
+                    <span className="block-menu-name">{t(ctxMenu.headingFold.folded ? 'fold.menu.unfold' : 'fold.menu.fold')}</span>
+                    <span className="block-menu-sc">{getCommandShortcut('editor.fold.toggle', effectiveKeybindings)}</span>
+                  </button>
+                )}
+                <button
+                  className="block-menu-item"
+                  data-heading-fold="level"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => pickHeadingFold({ action: 'level', level: ctxMenu.headingFold.level, fold: true })}
+                >
+                  <span className="block-menu-short" aria-hidden="true">H{ctxMenu.headingFold.level}</span>
+                  <span className="block-menu-name">{t('fold.menu.foldLevel', { level: ctxMenu.headingFold.level })}</span>
+                </button>
+                {ctxMenu.headingFold.anyFolded && (
+                  <button
+                    className="block-menu-item"
+                    data-heading-fold="unfoldAll"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => pickHeadingFold({ action: 'unfoldAll' })}
+                  >
+                    <span className="block-menu-short" aria-hidden="true">▾</span>
+                    <span className="block-menu-name">{t('fold.menu.unfoldAll')}</span>
+                    <span className="block-menu-sc">{getCommandShortcut('editor.fold.none', effectiveKeybindings)}</span>
+                  </button>
+                )}
+              </>
+            )}
+            {!ctxMenu.copyOnly && (<>
+            <div className="block-menu-divider" />
+            {ctxMenu.showTextFormatting && (
+              <>
+                <div className="block-menu-submenu-parent">
+                  <button className="block-menu-item block-menu-submenu-trigger" data-context-submenu-trigger="format" aria-haspopup="menu">
+                    <span className="block-menu-short">Aa</span>
+                    <span className="block-menu-name">{t('editor.textFormatting')}</span>
+                    <span className="block-menu-arrow" aria-hidden="true">›</span>
+                  </button>
+                  <div className="block-menu-submenu" data-context-submenu="format" role="menu">
+                    {[
+                      ['bold', 'tb.bold'],
+                      ['italic', 'tb.italic'],
+                      ['strike', 'tb.strike'],
+                      ['code', 'tb.code'],
+                      ['link', 'tb.link'],
+                      ['highlight', 'tb.highlight']
+                    ].map(([format, labelKey]) => (
+                      <button
+                        key={format}
+                        className="block-menu-item block-text-format"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => pickTextFormat(format, ctxMenu.selection)}
+                      >
+                        <span className="block-menu-short">{format === 'bold' ? 'B' : format === 'italic' ? 'I' : format === 'strike' ? 'S' : format === 'code' ? '</>' : format === 'link' ? '↗' : '▰'}</span>
+                        <span className="block-menu-name">{t(labelKey)}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="block-menu-divider" />
+                <div className="block-menu-submenu-parent">
+                  <button className="block-menu-item block-menu-submenu-trigger" data-context-submenu-trigger="review" aria-haspopup="menu">
+                    <span className="block-menu-short">↹</span>
+                    <span className="block-menu-name">{t('review.toolbar')}</span>
+                    <span className="block-menu-arrow" aria-hidden="true">›</span>
+                  </button>
+                  <div className="block-menu-submenu" data-context-submenu="review" role="menu">
+                    {[
+                      [REVIEW_KINDS.addition, 'review.add', '+'],
+                      [REVIEW_KINDS.deletion, 'review.delete', '-'],
+                      [REVIEW_KINDS.substitution, 'review.substitute', '→'],
+                      [REVIEW_KINDS.highlight, 'review.highlight', '▣']
+                    ].map(([kind, labelKey, symbol]) => (
+                      <button
+                        key={kind}
+                        className="block-menu-item block-review-action"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => pickReviewMarkup(kind, ctxMenu.selection)}
+                      >
+                        <span className="block-menu-short">{symbol}</span>
+                        <span className="block-menu-name">{t(labelKey)}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="block-menu-divider" />
+              </>
+            )}
+            {!ctxMenu.listConversion && (
+              <div className="block-menu-submenu-parent">
+                <button className="block-menu-item block-menu-submenu-trigger" data-context-submenu-trigger="block" aria-haspopup="menu">
+                  <span className="block-menu-short">H</span>
+                  <span className="block-menu-name">{t('block.turnInto')}</span>
+                  <span className="block-menu-arrow" aria-hidden="true">›</span>
+                </button>
+                <div className="block-menu-submenu" data-context-submenu="block" role="menu">
+                  {BLOCK_TYPES.map((b) => (
+                    <button key={b.id} className="block-menu-item" onMouseDown={(e) => e.preventDefault()} onClick={() => pickBlock(b.id)}>
+                      <span className="block-menu-short">{b.short}</span>
+                      <span className="block-menu-name">{t('block.' + b.id)}</span>
+                      <span className="block-menu-sc">{getCommandShortcut(b.commandId, effectiveKeybindings)}</span>
+                    </button>
+                  ))}
+                  {ctxMenu.blockListConvertible && (
+                    <>
+                      <div className="block-menu-divider" />
+                      {['bullet_list', 'ordered_list', 'task_list'].map((targetType) => (
+                        <button
+                          key={targetType}
+                          data-block-list-conversion={targetType}
+                          className="block-menu-item block-list-conversion"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => pickBlockListConversion(targetType, ctxMenu.blockPos)}
+                        >
+                          <span className="block-menu-short">
+                            {targetType === 'ordered_list' ? '1.' : targetType === 'task_list' ? '☐' : '-'}
+                          </span>
+                          <span className="block-menu-name">{t('list.convertTo.' + targetType)}</span>
+                        </button>
+                      ))}
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+            {ctxMenu.listConversion && (
+              <div className="block-menu-submenu-parent">
+                <button className="block-menu-item block-menu-submenu-trigger" data-context-submenu-trigger="list" aria-haspopup="menu">
+                  <span className="block-menu-short">☷</span>
+                  <span className="block-menu-name">{t('list.convert')}</span>
+                  <span className="block-menu-arrow" aria-hidden="true">›</span>
+                </button>
+                <div className="block-menu-submenu" data-context-submenu="list" role="menu">
+                  {ctxMenu.listConversion.actions.map((action) => (
+                    <button
+                      key={action.targetType}
+                      data-list-conversion={action.targetType}
+                      className="block-menu-item block-list-conversion"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => pickListConversion(
+                        action.targetType,
+                        ctxMenu.listConversion.listPos,
+                        ctxMenu.listConversion.anchorPos
+                      )}
+                    >
+                      <span className="block-menu-short">
+                        {action.targetType === 'ordered_list' ? '1.' : action.targetType === 'task_list' ? '☐' : '-'}
+                      </span>
+                      <span className="block-menu-name">
+                        {t('list.convertTo.' + action.targetType)}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {onToggleSourceRichSplit && (
+              <>
+                <div className="block-menu-divider" />
+                <button
+                  data-source-rich-toggle
+                  className="block-menu-item hm-source-rich-menu-item"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    setCtxMenu(null)
+                    onToggleSourceRichSplit()
+                  }}
+                >
+                  <span className="block-menu-short">▯</span>
+                  <span className="block-menu-name">
+                    {t('status.sourceRich')}
+                  </span>
+                </button>
+              </>
+            )}
+            </>)}
+          </div>
+        </>
+      )}
+
+      {zoom && (
+        <div
+          className="hm-image-lightbox"
+          onClick={() => setZoom(null)}
+          role="dialog"
+          aria-modal="true"
+        >
+          {zoom.type === 'svg'
+            ? <div ref={lightboxContentRef} className="hm-lightbox-svg" dangerouslySetInnerHTML={{ __html: zoom.html }} onClick={(e) => e.stopPropagation()} />
+            : <img ref={lightboxContentRef} src={zoom.src} alt="" className={isVectorImageSrc(zoom.src) ? 'hm-lightbox-vector' : undefined} onLoad={fitVectorLightboxImage} onClick={(e) => e.stopPropagation()} />
+          }
+          <div className="hm-lightbox-controls" onClick={(e) => e.stopPropagation()}>
+            <button title={t('lightbox.zoomOut')} aria-label={t('lightbox.zoomOut')} onClick={zoomOut}>
+              <Icon name="search-minus" size={18} />
+            </button>
+            <span className="hm-lightbox-scale" aria-live="polite">{Math.round(lightboxScale * 100)}%</span>
+            <button title={t('lightbox.zoomIn')} aria-label={t('lightbox.zoomIn')} onClick={zoomIn}>
+              <Icon name="search-plus" size={18} />
+            </button>
+            <span className="hm-lightbox-control-divider" />
+            <button title={t('lightbox.fit')} aria-label={t('lightbox.fit')} onClick={fitToWindow}>
+              <Icon name="expand" size={17} />
+            </button>
+            <button
+              className="hm-lightbox-actual"
+              title={t('lightbox.actual')}
+              aria-label={t('lightbox.actual')}
+              onClick={showActualSize}
+            >
+              1:1
+            </button>
+          </div>
+          <button
+            className="hm-lightbox-close"
+            title={t('lightbox.close')}
+            aria-label={t('lightbox.close')}
+            onClick={() => setZoom(null)}
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+      )}
+    </>
+  )
+}

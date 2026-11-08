@@ -1,0 +1,33 @@
+---
+title: Windows 安装
+description: 在 Windows 10 或 Windows 11 中安装 QuillMD，并处理 SmartScreen 提示。
+---
+
+# Windows 安装
+
+<span class="version-badge">适用于 QuillMD v0.0.1</span>
+
+QuillMD 当前提供 x64 NSIS 安装包，适用于常见的 Windows 10 和 Windows 11 电脑。
+
+## 安装步骤
+
+1. 下载 `QuillMD-Setup-0.13.29.exe`。
+2. 双击安装文件。
+3. 如果 Windows SmartScreen 显示“Windows 已保护你的电脑”，点击“更多信息”。
+4. 确认应用名称是 QuillMD，然后点击“仍要运行”。
+5. 在安装向导中选择安装目录并完成安装。
+6. 从开始菜单或桌面快捷方式打开 QuillMD。
+
+当前安装包尚未购买商业代码签名证书，所以 SmartScreen 可能显示“未知发布者”。这不代表安装包被判定为病毒。建议只从官网或 GitHub Release 下载，并在需要时对照开源仓库和 Release 文件名。
+
+::: warning 不要把文档放进安装目录
+Markdown 文档应保存在“文档”、桌面、同步盘或自己的项目文件夹中。不要把个人文件保存在 QuillMD 的程序安装目录里。
+:::
+
+## 更新版本
+
+有新版本时，QuillMD 右下角会弹出“发现新版本”。点 **直接下载**，QuillMD 会在后台下载并校验安装包，下载完成后点 **重启并安装**，QuillMD 会退出、自动安装并重新打开，不需要再去网页下载。下载前会自动比较 GitHub 和国内加速镜像的速度，选最快的线路（使用镜像时会显示“经 … 加速”）；无论从哪里下载，都用 GitHub 公布的校验值核对，不一致不会安装。有未保存的文档时会先询问。也可以在“设置 › 关于 › 检查更新”里手动检查；想先看更新说明，点“去 GitHub 查看”。
+
+手动更新：安装新版本前通常不需要卸载旧版本。退出 QuillMD，运行新版安装包并覆盖安装即可。工作区路径、最近文件和外观设置保存在用户数据目录中，不在应用安装目录内。
+
+如果 Windows 阻止安装、安装后打不开或文件关联异常，请查看[安装问题](/troubleshooting/installation)。

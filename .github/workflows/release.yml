@@ -1,0 +1,306 @@
+name: Release
+
+# Build installers for every version tag (v*), then upload them to a draft
+# GitHub Release. The target repository defaults to the repository that ran
+# the workflow; set the repository variable RELEASE_REPO to override it.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Create one draft release before the platform builders start. This avoids
+  # the historical race where concurrent electron-builder runs created two
+  # same-named draft releases.
+  init-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          TARGET_REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          echo "Release target: $TARGET_REPO"
+          echo "Release tag: $TAG"
+          if gh release view "$TAG" --repo "$TARGET_REPO" > /dev/null 2>&1; then
+            echo "Release already exists"
+          else
+            gh release create "$TAG" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --repo "$TARGET_REPO" \
+              --title "QuillMD ${TAG#v}"
+          fi
+
+  release:
+    needs: init-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      # Linux: electron-builder needs libgtk-3-dev and libnotify for desktop
+      # integration metadata; dpkg-deb verifies the .deb, and bsdtar creates
+      # and inspects the Arch pacman package.
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libnotify-dev dpkg libarchive-tools
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build bundles
+        run: npm run build
+
+      # NSIS's System.dll is fragile on Windows 11 26300: the old plugin
+      # crashes at startup, and the per-user known-folder System::Call still
+      # crashes even with the newer plugin. Apply both pinned patches before
+      # packaging; see SOP.md.
+      - name: Patch NSIS toolchain
+        if: matrix.platform == 'win'
+        run: |
+          node scripts/ci/patch-nsis-system-plugin.mjs
+          node scripts/ci/patch-nsis-multiuser.mjs
+
+      # USE_HARD_LINKS=false (#157): on CI electron-builder hard-links copies
+      # of the same source file. dpkg rejects hard links across file systems,
+      # so .deb installation failed on systems that mount /opt separately.
+      - name: Package (${{ matrix.platform }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USE_HARD_LINKS: 'false'
+        run: npx electron-builder --${{ matrix.platform }} --publish never
+
+      # electron-builder writes SHA-512 base64 into latest*.yml; the in-app
+      # updater compares against a hex digest, and clients without the
+      # normalizeSha512 fix (≤ v0.0.4) compare the YAML string as-is. Publish
+      # hex so every client, old and new, can verify its download.
+      - name: Normalize update metadata checksums
+        run: node scripts/ci/normalize-latest-yml-sha512.mjs dist
+
+      # NSIS installers fail on some Windows configurations (including the
+      # 3.04 System.dll crash above). Ship a portable zip alongside the
+      # installer so Windows always has an installer-free path.
+      - name: Build Windows portable zip
+        if: matrix.platform == 'win'
+        shell: bash
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG#v}
+          ZIP="QuillMD-${VERSION}-win-x64-portable.zip"
+          cd dist
+          mv win-unpacked QuillMD
+          7z a -tzip -mx=7 "${ZIP}" QuillMD
+          mv QuillMD win-unpacked
+          7z t "${ZIP}"
+          echo "Portable zip: dist/${ZIP}"
+
+      # Catch the Windows 11 26300 NSIS startup crash before publishing.
+      # Silent install passes even when the wizard crashes, so this checks
+      # that the GUI process is still alive after the first window.
+      - name: Smoke test Windows installer first window
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist/QuillMD-Setup-*.exe | Select-Object -First 1
+          ./scripts/ci/smoke-nsis-installer.ps1 -Installer $installer.FullName
+
+      - name: Upload Windows artifacts
+        if: matrix.platform == 'win'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          TARGET_REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          FILES=$(find dist -maxdepth 1 -type f \( \
+            -name '*.exe' -o \
+            -name '*.exe.blockmap' -o \
+            -name '*-win-x64-portable.zip' -o \
+            -name 'latest.yml' \
+          \) -print)
+          if ! ls dist/*-win-x64-portable.zip >/dev/null 2>&1; then
+            echo "::error::Windows portable zip is missing from dist/"
+            exit 1
+          fi
+          if [ -z "$FILES" ]; then
+            echo "::error::No Windows artifacts found in dist/"
+            exit 1
+          fi
+          echo "Uploading Windows artifacts:"
+          echo "$FILES"
+          gh release upload "$TAG" $FILES --clobber --repo "$TARGET_REPO"
+
+      - name: Upload macOS artifacts
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          TARGET_REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          FILES=$(find dist -maxdepth 1 -type f \( \
+            -name '*.dmg' -o \
+            -name '*.dmg.blockmap' -o \
+            -name '*.zip' -o \
+            -name '*.zip.blockmap' -o \
+            -name 'latest-mac.yml' \
+          \) -print)
+          if [ -z "$FILES" ]; then
+            echo "::error::No macOS artifacts found in dist/"
+            exit 1
+          fi
+          echo "Uploading macOS artifacts:"
+          echo "$FILES"
+          gh release upload "$TAG" $FILES --clobber --repo "$TARGET_REPO"
+
+      - name: Verify Linux .deb artifact
+        if: matrix.platform == 'linux'
+        run: |
+          DEB_FILE=$(ls dist/*.deb 2>/dev/null | head -1)
+          if [ -z "$DEB_FILE" ]; then
+            echo "::error::No .deb file found in dist/"
+            exit 1
+          fi
+          echo "Found: $DEB_FILE"
+          echo "Size: $(stat -c%s "$DEB_FILE") bytes"
+          dpkg-deb --info "$DEB_FILE"
+          # The postinst must make chrome-sandbox root-owned and SUID; Ubuntu
+          # 24.04+ restricted unprivileged user namespaces crash otherwise.
+          CTRL_DIR=$(mktemp -d)
+          dpkg-deb --control "$DEB_FILE" "$CTRL_DIR"
+          grep -q "chown root:root '/opt/QuillMD/chrome-sandbox'" "$CTRL_DIR/postinst"
+          grep -q "chmod 4755 '/opt/QuillMD/chrome-sandbox'" "$CTRL_DIR/postinst"
+          if grep -q "chmod 0755 '/opt/QuillMD/chrome-sandbox'" "$CTRL_DIR/postinst"; then
+            echo "::error::postinst still downgrades chrome-sandbox to 0755"
+            exit 1
+          fi
+          HARDLINKS=$(dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tvf - | grep -c '^h' || true)
+          if [ "$HARDLINKS" != "0" ]; then
+            dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tvf - | grep '^h'
+            echo "::error::.deb contains $HARDLINKS hard link(s)"
+            exit 1
+          fi
+          echo "✅ .deb artifact is valid (postinst sets SUID chrome-sandbox, no hard links)"
+
+      - name: Upload Linux .deb artifact
+        if: matrix.platform == 'linux'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          TARGET_REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          gh release upload "$TAG" dist/*.deb --clobber --repo "$TARGET_REPO"
+
+      # Arch Linux: install the pacman package in a clean container and launch
+      # it under Xvfb before uploading it.
+      - name: Verify Arch Linux package
+        if: matrix.platform == 'linux'
+        run: |
+          PKG=$(ls dist/*.pkg.tar.xz 2>/dev/null | head -1)
+          if [ -z "$PKG" ]; then
+            echo "::error::No .pkg.tar.xz file found in dist/"
+            exit 1
+          fi
+          if bsdtar -tvf "$PKG" | grep -q '^h'; then
+            bsdtar -tvf "$PKG" | grep '^h'
+            echo "::error::pacman package contains hard links"
+            exit 1
+          fi
+          docker run --rm --privileged --shm-size=1g \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/scripts/ci:/ci:ro" \
+            archlinux:latest bash /ci/verify-arch-package.sh "/dist/$(basename "$PKG")"
+
+      - name: Upload Arch Linux package
+        if: matrix.platform == 'linux'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          TARGET_REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          gh release upload "$TAG" dist/*.pkg.tar.xz --clobber --repo "$TARGET_REPO"
+
+      - name: Upload Linux update metadata
+        if: matrix.platform == 'linux'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          TARGET_REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          if compgen -G "dist/latest-linux.yml" > /dev/null; then
+            gh release upload "$TAG" dist/latest-linux.yml --clobber --repo "$TARGET_REPO"
+          else
+            echo "No latest-linux.yml produced; skipping update metadata"
+          fi
+
+  # Public releases only after both the GitHub assets and the CNB mirror are
+  # complete. If either build or mirror fails, the GitHub release stays draft
+  # so it can be inspected or retried instead of exposing a partial release.
+  publish-release:
+    needs: [release, sync-cnb]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          TARGET_REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          gh release edit "$TAG" --draft=false --repo "$TARGET_REPO"
+          echo "Published $TAG on $TARGET_REPO"
+
+  # GitHub is the build source. CNB is a source and release mirror for users
+  # who cannot reach GitHub directly. Configure CNB_TOKEN as a repository
+  # secret (repo-release:rw) to enable this job.
+  sync-cnb:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Mirror release assets to CNB
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_REPO: boris007/QuillMD
+        run: node scripts/ci/sync-cnb-release.mjs
